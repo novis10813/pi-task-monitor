@@ -1,0 +1,19 @@
+{
+	"compilerOptions": {
+		"target": "es2022",
+		"module": "nodenext",
+		"moduleResolution": "nodenext",
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"baseUrl": ".",
+		"typeRoots": ["/home/novis/.nvm/versions/node/v24.15.0/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@types"],
+		"paths": {
+			"@earendil-works/pi-coding-agent": ["/home/novis/.nvm/versions/node/v24.15.0/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"],
+			"@earendil-works/pi-ai": ["/home/novis/.nvm/versions/node/v24.15.0/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.d.ts"],
+			"@earendil-works/pi-tui": ["/home/novis/.nvm/versions/node/v24.15.0/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui/dist/index.d.ts"],
+			"typebox": ["/home/novis/.nvm/versions/node/v24.15.0/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/typebox/build/index.d.mts"]
+		}
+	},
+	"include": ["*.ts"]
+}

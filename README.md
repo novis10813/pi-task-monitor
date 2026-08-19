@@ -1,0 +1,109 @@
+# task-monitor
+
+A pi extension for **durable background process tracking**. Two focused tools,
+zero npm dependencies (Node builtins only), POSIX only (Linux first; macOS
+degrades CPU sampling to lifetime averages).
+
+## What it does
+
+- **`spawn_background`** — start a long-running shell command as a *detached*
+  process. It keeps running when pi is closed, killed, or the machine reboots
+  (well: when pi is closed — the process is reparented to init). Output goes to
+  a per-task log; the real exit code **and exit time** go to a sidecar file.
+- **`monitor`** — inspect tasks:
+  - `status` (all, or one with recent output)
+  - `tail` (last N lines of the log)
+  - `usage` (CPU / RAM / GPU / VRAM stats + raw samples)
+  - `wait` (block until exit or timeout; Esc interrupts)
+  - `kill` (SIGTERM the whole process group, escalate to SIGKILL after 5s)
+- **`/tasks`** — TUI panel: list, detail + live tail (`l`), kill (`k`, confirm),
+  log path (`c`).
+- **Exit callback** — when a tracked task exits (code 0 or not), the agent is
+  woken with a `[task-event]` message: state, exit code, duration, log tail,
+  and — for non-zero exits — a resource-usage peak line (helps diagnose OOM /
+  runaway CPU).
+- **Recovery report** — if tasks exited while no pi session was open, the next
+  `session_start` injects a `[task-event recovery]` message into the agent's
+  first turn, listing what happened.
+- **Footer** — while tasks run, the status bar shows `N running · M done`.
+- **Prune** — terminal tasks older than 7 days are cleaned at session start
+  (registry entry + log/exit/usage/claim files). Running tasks are never pruned.
+
+## Why this design (the two gaps it fills)
+
+Existing pi background-task extensions (pi-background-tasks, pi-tmux, etc.)
+tie tasks to the *session process*. Close the TUI and the tracker is gone:
+no one records the exit, no one wakes the agent later.
+
+task-monitor's source of truth is **on disk** (`<project>/.pi/tasks/`):
+
+```
+.pi/tasks/
+  registry.json          # task list + states + "reported" watermarks
+  <id>.log               # stdout+stderr (20 MiB hard cap -> log_overflow kill)
+  <id>.exit              # "<exit-code> <epoch-seconds>" sidecar
+  <id>.usage.jsonl       # 3s-interval resource samples (2 MiB, 1-gen rotation)
+  <id>.claim             # transient cross-process "I will report this" locks
+  .registry.lock         # transient single-writer lock (O_EXCL, stale-broken)
+```
+
+Mechanism per task:
+
+```
+bash -lc 'cd <cwd> && ( <command> ) > <log> 2>&1; printf "%s %s\n" $? "$(date +%s)" > <exit>'
+```
+
+spawned with `detached: true` + `unref()`. Bash becomes the process-group
+leader, so `kill(-pid)` stops the whole tree (npm -> node -> ...). The command
+runs in a **subshell** so a user `exit N` can't skip the sidecar write.
+
+## Guarantees & documented trade-offs
+
+- **Callback delivery is at-most-once, never duplicated.** Each task's
+  transition is claimed (`O_EXCL` file, safe across pi processes), watermarked
+  in the registry (durably, before the message is sent), then sent; a crash in
+  the save→send window loses that one notification, but the final state always
+  remains visible via `monitor(status)` / `/tasks` — and the next session start
+  re-reports it as recovery if the watermark was never written.
+- **Cancelled tasks never notify** (an explicit stop isn't news); the
+  suppression is durable via the watermark.
+- **`endedAt` accuracy:** the sidecar carries the real exit time, so durations
+  are correct even when the exit is first observed after a restart. Tasks that
+  died without a sidecar (OOM, external SIGKILL) show `exited(unknown)`.
+- **Single writer:** all registry mutations go through `withRegistryLock`
+  (in-process mutex + O_EXCL file lock with 2s stale-break, fresh read →
+  mutate → atomic tmp+rename save). Two pi sessions on one project are safe.
+- **Poller cost:** one 3s tick per project while tasks run; self-stops when
+  idle; `monitor(status)`/`session_start` also settle, so state never lags
+  more than one tick when something is alive.
+- **GPU:** `nvidia-smi` auto-detected once per process; absent ⇒
+  `gpu`/`vram` are `null` with zero overhead (AMD/ROCm is out of scope for v1).
+- **Log cap:** 20 MiB hard cap, no rotation (avoids sparse-file / orphan-inode
+  pitfalls); overflow kills the group and marks `log_overflow`.
+
+## File map
+
+| file | role |
+|---|---|
+| `index.ts` | extension entry: tools, `/tasks` panel, session hooks, delivery ctx |
+| `registry.ts` | disk registry: atomic save, probe, single-writer lock |
+| `spawner.ts` | detached spawn, wrapper, `killGroup`, `cancelTask` |
+| `poller.ts` | `settleRegistry` (the only state-transition code), 3s heartbeat, prune |
+| `usage.ts` | /proc CPU (jiffies Δ) + RSS, nvidia-smi GPU%/VRAM, JSONL sampling/reports |
+| `delivery.ts` | claim + watermark + send (exactly-once-ish), recovery message builder |
+| `format.ts` | display helpers (durations, labels, colors, footer) |
+
+## Development
+
+- Type-check: `tsc -p tsconfig.json` (paths point at the installed pi dist).
+- Smoke test (mock pi, no LLM): `/tmp/tm-spike/smoke.mjs` — 41 checks covering
+  spawn, callbacks, recovery, wait/kill, prune, cross-tick concurrency.
+- Runtime deps: none (pure Node ≥ 22.19 builtins). Loaded by pi's jiti with the
+  standard `@earendil-works/*` + `typebox` aliases.
+
+## Known non-goals (v1)
+
+- Interactive TUIs (use tmux via the `long-running-cli` skill for those).
+- Windows.
+- AMD/Intel GPU metrics.
+- Cross-machine durability (the registry is per-project, on the local disk).

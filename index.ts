@@ -1,7 +1,7 @@
 // task-monitor — durable background process tracking for pi.
 //
 //   - spawn_background tool (detached spawn, disk registry, survives pi exit)
-//   - monitor tool: status | tail | usage
+//   - kill_background tool (SIGTERM → SIGKILL)
 //   - /tasks TUI panel (list, detail/tail, kill)
 //   - 3s poller: state settle, CPU/RAM/GPU/VRAM sampling, exit callbacks
 //   - session_start recovery report for events that happened while closed
@@ -9,7 +9,6 @@
 // Registry writes are serialized through withRegistryLock (single-writer);
 // settleRegistry (poller.ts) is the only place state transitions happen.
 
-import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	formatSize,
 	type ExtensionAPI,
@@ -31,8 +30,7 @@ import {
 import { cancelTask, spawnTask } from "./spawner.js";
 import { durationOf, footerText, stateColor, stateLabel } from "./format.js";
 import { buildRecoveryMessage, clearStaleClaims, deliverEvents, type DeliveryCtx } from "./delivery.js";
-import { ensurePoller, pruneOld, settleRegistry, stopPollerFor } from "./poller.js";
-import { usageReport, type UsageReport, type UsageStat } from "./usage.js";
+import { ensurePoller, pruneDelivered, pruneOld, settleRegistry, stopPollerFor } from "./poller.js";
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -40,8 +38,12 @@ import { usageReport, type UsageReport, type UsageStat } from "./usage.js";
 
 /**
  * Build a DeliveryCtx. `recovery` selects the safe session_start delivery mode:
- * - live callbacks (poller): followUp + triggerTurn — wake the agent now. Safe
- *   because the user prompt was already submitted, so no prompt() collision.
+ * - live callbacks (poller): steer + triggerTurn — wake the agent now.
+ *   Busy agent: steer is injected after the current tool-call batch, before the
+ *   next LLM call (mid-turn notice); followUp would hold the event until the
+ *   whole turn finishes. Idle agent: triggerTurn starts a turn immediately
+ *   (deliverAs is moot when not streaming). No prompt() race: while streaming
+ *   steer only enqueues, and the user prompt was already submitted.
  * - recovery (session_start): nextTurn — queue for the next turn without
  *   triggering. Using triggerTurn here races the CLI `-p` prompt in print mode
  *   (prompt() throws "Agent is already processing") and is noisy in TUI.
@@ -53,7 +55,7 @@ function makeDeliveryCtx(pi: ExtensionAPI, ctx: ExtensionContext, recovery = fal
 		sendMessage: (content, details) =>
 			pi.sendMessage(
 				{ customType: recovery ? "task-event-recovery" : "task-event", content, display: true, details },
-				recovery ? { deliverAs: "nextTurn" } : { deliverAs: "followUp", triggerTurn: true },
+				recovery ? { deliverAs: "nextTurn" } : { deliverAs: "steer", triggerTurn: true },
 			),
 		notify: (m, k) => {
 			if (ctx.hasUI) ctx.ui.notify(m, k);
@@ -68,61 +70,7 @@ function refreshCtx(ctx: ExtensionContext): TaskEntry[] {
 	return registry.tasks;
 }
 
-function findTask(cwd: string, id: string): TaskEntry {
-	const t = snapshotRegistry(cwd).tasks.find((x) => x.id === id);
-	if (!t) throw new Error(`unknown task id: ${id} (use monitor with action="status" to list tasks)`);
-	return t;
-}
 
-function listText(tasks: TaskEntry[], cwd: string): string {
-	if (tasks.length === 0) return `No background tasks for project ${cwd}.`;
-	const lines = tasks.map(
-		(t) => `• ${t.id}  ${stateLabel(t).padEnd(16)} ${durationOf(t).padStart(8)}  "${t.name}"  ${t.command}${t.state === "running" ? `  (pid ${t.pid})` : ""}`,
-	);
-	lines.push(`Log dir: ${tasksDir(cwd)}`);
-	return lines.join("\n");
-}
-
-function oneText(t: TaskEntry): string {
-	const tail = tailFile(t.log, 4096).split("\n").slice(-5).join("\n");
-	const head = [
-		`${t.id}  ${stateLabel(t)}  ${durationOf(t)}`,
-		`name:    ${t.name}`,
-		`command: ${t.command}`,
-		`cwd:     ${t.cwd}`,
-		t.state === "running" ? `pid:     ${t.pid}` : `exit:    ${t.exitCode ?? "unknown"}`,
-		`log:     ${t.log} (${formatSize(t.logBytes)})`,
-		`timeout: ${t.timeoutSeconds ?? "none"}`,
-	];
-	return tail ? `${head.join("\n")}\n--- last 5 lines ---\n${tail}` : head.join("\n");
-}
-
-function tailText(t: TaskEntry, n: number): string {
-	const raw = tailFile(t.log, 50 * 1024);
-	const all = raw.split("\n");
-	const lines = all.slice(-n).join("\n");
-	const note = raw.length >= 50 * 1024 ? " (showing last 50KB of log)" : "";
-	return `--- last ${n} lines of ${t.log} (${formatSize(t.logBytes)})${note} ---\n${lines}`;
-}
-
-function usageText(t: TaskEntry, rep: UsageReport): string {
-	const line = (label: string, s: UsageStat | null, unit: string): string => {
-		if (!s) return `  ${label.padEnd(5)} n/a`;
-		const trend = s.trend === "flat" ? "" : `  (${s.trend})`;
-		return `  ${label.padEnd(5)} min ${s.min}${unit}  max ${s.max}${unit}  avg ${s.avg}${unit}  peak @${new Date(s.peakAt).toISOString().slice(11, 16)}${trend}`;
-	};
-	const raw = rep.samples.slice(-5).map((s) => `  ${JSON.stringify(s)}`).join("\n");
-	return [
-		`usage ${t.id} "${t.name}" (window ${rep.windowMin}m, ${rep.count} samples, ${rep.procs ?? "?"} procs):`,
-		line("cpu", rep.cpu, "%"),
-		line("rss", rep.rss_mb, "MB"),
-		line("gpu", rep.gpu, "%"),
-		line("vram", rep.vram_mb, "MB"),
-		`raw (last ${Math.min(5, rep.samples.length)}):`,
-		raw,
-		`full history: ${rep.file}`,
-	].join("\n");
-}
 
 // ---------------------------------------------------------------------------
 // /tasks panel
@@ -301,11 +249,14 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`task-monitor: ${sent.length} task event(s) while you were away — reported to the agent`, "info");
 				}
 			}
-			recoveryDc.setFooter(footerText(registry.tasks));
+			// Delivered terminal tasks are disposable now; also sweeps leftovers
+			// from sessions where the poller stopped before pruning.
+			await pruneDelivered(ctx.cwd);
+			recoveryDc.setFooter(footerText(snapshotRegistry(ctx.cwd).tasks));
 		} catch (e) {
 			if (ctx.hasUI) ctx.ui.notify(`task-monitor: recovery failed: ${(e as Error).message}`, "error");
 		}
-		// The poller must use LIVE delivery (followUp + triggerTurn) for exit callbacks.
+		// The poller must use LIVE delivery (steer + triggerTurn) for exit callbacks.
 		ensurePoller(ctx.cwd, makeDeliveryCtx(pi, ctx, false));
 		void pruneOld(ctx.cwd) // best-effort 7-day prune of terminal tasks
 			.catch(() => {});
@@ -324,7 +275,8 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use spawn_background (not bash) for commands expected to run longer than a few minutes or that must outlive this session (dev servers, long builds, watchers, migrations).",
 			"spawn_background is for long-running shell processes; use task-planning tools (e.g. TaskCreate) for multi-step work plans — do not conflate the two.",
-			"Check background processes with monitor (action=\"status\" or \"tail\"); never poll them with bash sleep loops.",
+			"You will be notified via callback when the task exits; use /tasks (TUI) to inspect manually.",
+			"Never poll background processes with bash sleep loops.",
 		],
 		parameters: Type.Object({
 			command: Type.String({ description: "Shell command to run (executed via bash -lc in a subshell; stdout+stderr go to a log file)" }),
@@ -360,6 +312,7 @@ export default function (pi: ExtensionAPI) {
 					if (x) x.reported = { state: x.state, logBytes: x.logBytes };
 				});
 				entry = loadRegistry(cwd).tasks.find((x) => x.id === entry.id)!;
+				void pruneDelivered(cwd).catch(() => {}); // tool result was the notification
 			}
 			refreshCtx(ctx);
 			ensurePoller(cwd, makeDeliveryCtx(pi, ctx, false));
@@ -370,12 +323,12 @@ export default function (pi: ExtensionAPI) {
 					? [
 							`Task ${id} "${entry.name}" started (pid ${entry.pid}).`,
 							`Log: ${entry.log}`,
-							`You will be notified when it exits (code + output tail). Check anytime with monitor(task_id="${id}", action="status"|"tail").`,
+							`You will be notified when it exits (code + output tail).`,
 						].join("\n")
 					: [
 							`Task ${id} "${entry.name}" exited instantly with code ${entry.exitCode ?? "unknown"}`,
 							`Log: ${entry.log}`,
-							`Use monitor(task_id="${id}", action="tail") to read the output.`,
+							`Use /tasks (TUI) to inspect the log manually.`,
 						].join("\n");
 			return {
 				content: [{ type: "text", text }],
@@ -398,120 +351,34 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "monitor",
-		label: "Monitor",
+		name: "kill_background",
+		label: "Kill Background",
 		description:
-			"Inspect background processes started with spawn_background. Actions: status (all tasks, or one task with recent output), tail (last N lines of a task's log), usage (CPU/RAM/GPU/VRAM stats), wait (block until the task exits or the timeout elapses), kill (stop the task).",
-		promptSnippet: "Check status, tail the log, inspect resource usage, wait for, or kill a background process",
+			"Stop a background process started with spawn_background. SIGTERM the whole process group, escalate to SIGKILL after a grace period. No completion notice is sent for a killed task.",
+		promptSnippet: "Stop a background process",
 		promptGuidelines: [
-			"For resource problems (suspected OOM, memory leak, CPU spike), call monitor with action=\"usage\" before deciding to kill or restart.",
-			"To block on a background task finishing, use monitor with action=\"wait\" (not a bash sleep loop).",
+			"Use this only when you know the task must stop (e.g. wrong command, resource problem); otherwise let it finish and rely on the exit callback.",
 		],
 		parameters: Type.Object({
-			action: StringEnum(["status", "tail", "usage", "wait", "kill"] as const),
-			task_id: Type.Optional(Type.String({ description: "Task id from spawn_background. Omit with action=status to list all tasks; required for all other actions." })),
-			lines: Type.Optional(Type.Number({ description: "For tail: number of lines (default 30, max 200)" })),
-			window_minutes: Type.Optional(Type.Number({ description: "For usage: statistics window in minutes (default 30)" })),
-			samples: Type.Optional(Type.Number({ description: "For usage: raw samples to return (default 20, max 100)" })),
-			timeout_seconds: Type.Optional(Type.Number({ description: "For wait: max seconds to block (default 30, max 300)" })),
+			task_id: Type.String({ description: "Task id from spawn_background" }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (params.action === "status") {
-				// Settle (locked) so the agent always sees current truth.
-				const registry = await settleRegistry(ctx.cwd);
-				const tasks = registry.tasks;
-				ctx.ui.setStatus("task-monitor", footerText(tasks));
-				if (!params.task_id) {
-					return {
-						content: [{ type: "text", text: listText(tasks, ctx.cwd) }],
-						details: { count: tasks.length },
-					};
-				}
-				const t = findTask(ctx.cwd, params.task_id);
-				return { content: [{ type: "text", text: oneText(t) }], details: { id: t.id, state: t.state } };
-			}
-			const t = findTask(ctx.cwd, params.task_id!);
-			if (params.action === "tail") {
-				const n = Math.min(200, Math.max(1, Math.round(params.lines ?? 30)));
-				return { content: [{ type: "text", text: tailText(t, n) }], details: { id: t.id, logBytes: t.logBytes } };
-			}
-			if (params.action === "kill") {
-				const r = await cancelTask(ctx.cwd, t.id);
-				if (!r.ok) throw new Error(r.error);
-				return {
-					content: [{ type: "text", text: `Task ${t.id} "${r.name}" stopped (${r.outcome}). No completion notice will be sent for it.` }],
-					details: { id: t.id, outcome: r.outcome },
-				};
-			}
-			if (params.action === "wait") {
-				const maxSec = Math.min(300, Math.max(1, Math.round(params.timeout_seconds ?? 30)));
-				const deadline = Date.now() + maxSec * 1000;
-				let aborted = false;
-				const onAbort = () => (aborted = true);
-				_signal?.addEventListener?.("abort", onAbort, { once: true });
-				try {
-					for (;;) {
-						const cur = findTask(ctx.cwd, t.id);
-						if (cur.state !== "running") {
-							const tail = tailFile(cur.log, 8192).split("\n").filter((x) => x.length > 0).slice(-20).join("\n");
-							return {
-								content: [{
-									type: "text",
-									text: `Task ${cur.id} "${cur.name}" ${stateLabel(cur)} after ${durationOf(cur)}.${tail ? `\n--- last 20 lines ---\n${tail}` : ""}`,
-								}],
-								details: { id: cur.id, state: cur.state, exitCode: cur.exitCode },
-							};
-						}
-						if (aborted) {
-							return {
-								content: [{ type: "text", text: `Wait interrupted. Task ${t.id} is still running; call monitor(action="wait") again to resume waiting.` }],
-								details: { id: t.id, interrupted: true },
-							};
-						}
-						const remaining = deadline - Date.now();
-						if (remaining <= 0) break;
-						await new Promise((r) => setTimeout(r, Math.min(500, remaining)));
-					}
-					const cur = findTask(ctx.cwd, t.id);
-					if (cur.state !== "running") {
-						const tail = tailFile(cur.log, 8192).split("\n").filter((x) => x.length > 0).slice(-20).join("\n");
-						return {
-							content: [{ type: "text", text: `Task ${cur.id} "${cur.name}" ${stateLabel(cur)} after ${durationOf(cur)}.${tail ? `\n--- last 20 lines ---\n${tail}` : ""}` }],
-							details: { id: cur.id, state: cur.state, exitCode: cur.exitCode },
-						};
-					}
-					return {
-						content: [{ type: "text", text: `Task ${t.id} "${cur.name}" still ${cur.state} after ${maxSec}s. It will keep running; call monitor(action="wait") again to continue waiting, or action="kill" to stop it.` }],
-						details: { id: t.id, state: cur.state, timedOut: true },
-					};
-				} finally {
-					_signal?.removeEventListener?.("abort", onAbort);
-				}
-			}
-			// usage
-			const rep = usageReport(
-				t,
-				Math.max(1, Math.round(params.window_minutes ?? 30)),
-				Math.min(100, Math.max(1, Math.round(params.samples ?? 20))),
-			);
-			if (!rep) {
-				return {
-					content: [{ type: "text", text: `No usage samples for ${t.id} yet (task too new, or sampling unavailable on this platform). Log: ${t.log}` }],
-					details: { id: t.id },
-				};
-			}
-			return { content: [{ type: "text", text: usageText(t, rep) }], details: { id: t.id, count: rep.count } };
+			const r = await cancelTask(ctx.cwd, params.task_id);
+			if (!r.ok) throw new Error(r.error);
+			refreshCtx(ctx);
+			return {
+				content: [{ type: "text", text: `Task ${params.task_id} "${r.name}" stopped (${r.outcome}). No completion notice will be sent for it.` }],
+				details: { id: params.task_id, outcome: r.outcome },
+			};
 		},
 		renderCall(args, theme) {
 			const text =
-				theme.fg("toolTitle", theme.bold("monitor ")) +
-				theme.fg("muted", args.action) +
-				(args.task_id ? theme.fg("accent", ` ${args.task_id}`) : "") +
-				(args.lines ? theme.fg("dim", ` ${args.lines} lines`) : "");
+				theme.fg("toolTitle", theme.bold("kill_background ")) +
+				theme.fg("accent", typeof args.task_id === "string" ? args.task_id : "");
 			return new Text(text, 0, 0);
 		},
 		renderResult(result, { isPartial }, theme) {
-			if (isPartial) return new Text(theme.fg("warning", "inspecting..."), 0, 0);
+			if (isPartial) return new Text(theme.fg("warning", "stopping..."), 0, 0);
 			const c = result.content[0];
 			return new Text(c?.type === "text" ? c.text : "", 0, 0);
 		},

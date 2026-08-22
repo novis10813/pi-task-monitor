@@ -11,12 +11,12 @@
 // Consequences:
 //   - No duplicate notifications (watermark precedes send).
 //   - A crash in the narrow save->send window loses ONE notification
-//     (at-most-once). The task's final state is still visible via
-//     monitor(status)/(/tasks), so nothing is unrecoverable.
+//     (at-most-once) — and, since delivered-looking tasks are pruned, the
+//     task's record with it. Nothing else is unrecoverable.
 //   - Cancelled tasks never notify (explicit stop is not news); the suppression
 //     is durable via the watermark, so restarts stay silent too.
 
-import { closeSync, openSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tailFile, tasksDir, type TaskEntry, withRegistryLock } from "./registry.js";
 import { fmtDur } from "./format.js";
@@ -64,6 +64,11 @@ export function releaseClaim(cwd: string, id: string): void {
 	} catch {
 		/* already gone */
 	}
+}
+
+/** True if a claim file exists (delivery in flight, retrying, or stuck). */
+export function hasClaim(cwd: string, id: string): boolean {
+	return existsSync(claimPath(cwd, id));
 }
 
 /**
@@ -145,7 +150,7 @@ export function buildRecoveryMessage(terminal: TaskEntry[], running: TaskEntry[]
  *
  * The watermark precedes the send: no duplicates ever; a crash in the
  * save->send window loses at most one notification (at-most-once), and the
- * final state stays visible via monitor(status) / /tasks.
+ * final state stays visible via /tasks.
  */
 export async function deliverEvents(
 	cwd: string,

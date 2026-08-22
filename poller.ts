@@ -4,8 +4,7 @@
 //
 // settleRegistry is the SINGLE place durable state transitions happen
 // (timeout / exit / log-overflow / cancel-reaper), under the registry lock.
-// session_start and monitor(status) call it too, so every reader sees
-// settled state.
+// session_start calls it too, so every reader sees settled state.
 
 import { existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -23,7 +22,8 @@ import {
 } from "./registry.js";
 import { killGroup } from "./spawner.js";
 import { sampleUsage, usageFileFor, usageSummaryLine } from "./usage.js";
-import { deliverEvents, type DeliveryCtx } from "./delivery.js";
+import { deliverEvents, hasClaim, type DeliveryCtx } from "./delivery.js";
+import { forgetTask } from "./usage.js";
 import { fmtDur, footerText } from "./format.js";
 
 const POLL_INTERVAL_MS = 3_000;
@@ -78,7 +78,7 @@ export async function settleRegistry(cwd: string, now = Date.now()): Promise<Reg
 	});
 }
 
-/** One tick: settle -> sample usage -> deliver due callbacks -> footer. */
+/** One tick: settle -> sample usage -> deliver due callbacks -> prune -> footer. */
 export async function runTick(cwd: string, dc: DeliveryCtx): Promise<void> {
 	const registry = await settleRegistry(cwd);
 	const running = registry.tasks.filter((t) => t.state === "running");
@@ -91,6 +91,7 @@ export async function runTick(cwd: string, dc: DeliveryCtx): Promise<void> {
 	if (due.length > 0) {
 		await deliverEvents(cwd, due, dc, buildExitMessage);
 	}
+	await pruneDelivered(cwd);
 	dc.setFooter(footerText(registry.tasks));
 }
 
@@ -171,6 +172,44 @@ export function stopPollerFor(cwd: string): void {
 
 const PRUNE_MAX_AGE_MS = 7 * 24 * 3600 * 1000; // 7 days
 
+function removeTaskFiles(cwd: string, t: TaskEntry): void {
+	const dir = tasksDir(cwd);
+	for (const f of [t.log, t.exitFile, usageFileFor(t), `${usageFileFor(t)}.prev`, join(dir, `${t.id}.claim`)]) {
+		try {
+			unlinkSync(f);
+		} catch {
+			/* already gone */
+		}
+	}
+}
+
+/**
+ * Remove terminal tasks whose transition has been fully delivered to the
+ * agent (`reported` == current state). A task with a live claim is skipped:
+ * the send may still be retrying and needs the log/usage files to build the
+ * message. Tasks with callback=false are never delivered — they fall through
+ * to pruneOld. Called each tick after delivery and at session_start.
+ */
+export async function pruneDelivered(cwd: string): Promise<number> {
+	if (!existsSync(registryPath(cwd))) return 0;
+	return withRegistryLock(cwd, (reg) => {
+		const keep: TaskEntry[] = [];
+		let removed = 0;
+		for (const t of reg.tasks) {
+			const delivered = t.state !== "running" && t.reported.state === t.state;
+			if (!delivered || hasClaim(cwd, t.id)) {
+				keep.push(t);
+				continue;
+			}
+			removeTaskFiles(cwd, t);
+			forgetTask(t.id);
+			removed++;
+		}
+		reg.tasks = keep;
+		return removed;
+	});
+}
+
 /**
  * Remove terminal tasks older than 7 days (registry entry + log/exit/usage/
  * claim files). Running tasks are never pruned. Returns the count removed.
@@ -184,16 +223,9 @@ export async function pruneOld(cwd: string): Promise<number> {
 			(t) => t.state === "running" || (t.endedAt ?? t.createdAt) >= now - PRUNE_MAX_AGE_MS,
 		);
 		const removed = reg.tasks.length - keep.length;
-		const dir = tasksDir(cwd);
 		for (const t of reg.tasks) {
 			if (keep.includes(t)) continue;
-			for (const f of [t.log, t.exitFile, usageFileFor(t), `${usageFileFor(t)}.prev`, join(dir, `${t.id}.claim`)]) {
-				try {
-					unlinkSync(f);
-				} catch {
-					/* already gone */
-				}
-			}
+			removeTaskFiles(cwd, t);
 		}
 		reg.tasks = keep;
 		return removed;

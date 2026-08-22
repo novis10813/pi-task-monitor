@@ -206,7 +206,7 @@ export async function sampleUsage(tasks: TaskEntry[]): Promise<void> {
 	}
 }
 
-/** Drop CPU baseline for terminal tasks (bounded map). */
+/** Drop the CPU baseline of a removed task (keeps prevTicks bounded). */
 export function forgetTask(id: string): void {
 	prevTicks.delete(id);
 }
@@ -222,30 +222,11 @@ function appendSample(t: TaskEntry, s: UsageSample): void {
 }
 
 // ---------------------------------------------------------------------------
-// reading (monitor action=usage)
+// reading (exit-callback resource summary)
 // ---------------------------------------------------------------------------
 
-export interface UsageStat {
-	min: number;
-	max: number;
-	avg: number;
-	peakAt: number; // timestamp of max
-	trend: "rising" | "falling" | "flat";
-}
-
-export interface UsageReport {
-	count: number;
-	procs: number | null;
-	windowMin: number;
-	file: string;
-	samples: UsageSample[]; // last N raw samples
-	cpu: UsageStat | null;
-	rss_mb: UsageStat | null;
-	gpu: UsageStat | null;
-	vram_mb: UsageStat | null;
-}
-
-export function usageReport(t: TaskEntry, windowMin = 30, maxSamples = 20): UsageReport | null {
+/** One-line resource summary for exit callbacks (non-zero exits). */
+export function usageSummaryLine(t: TaskEntry): string | null {
 	const file = usageFileFor(t);
 	if (!existsSync(file)) return null;
 	let raw: string;
@@ -254,59 +235,28 @@ export function usageReport(t: TaskEntry, windowMin = 30, maxSamples = 20): Usag
 	} catch {
 		return null;
 	}
-	const cutoff = Date.now() - windowMin * 60000;
-	const samples: UsageSample[] = [];
+	// Peak over the whole history (bounded by 2MiB rotation).
+	let cpuMax: number | null = null;
+	let rssMax: number | null = null;
+	let gpuMax: number | null = null;
+	let vramMax: number | null = null;
 	for (const line of raw.split("\n")) {
 		if (!line) continue;
 		try {
-			const s = JSON.parse(line) as UsageSample;
-			if (typeof s.t === "number" && s.t >= cutoff) samples.push(s);
+			const s = JSON.parse(line) as { cpu?: number | null; rss_mb?: number | null; gpu?: number | null; vram_mb?: number | null };
+			if (typeof s.cpu === "number") cpuMax = Math.max(cpuMax ?? -Infinity, s.cpu);
+			if (typeof s.rss_mb === "number") rssMax = Math.max(rssMax ?? -Infinity, s.rss_mb);
+			if (typeof s.gpu === "number") gpuMax = Math.max(gpuMax ?? -Infinity, s.gpu);
+			if (typeof s.vram_mb === "number") vramMax = Math.max(vramMax ?? -Infinity, s.vram_mb);
 		} catch {
 			/* skip corrupt line */
 		}
 	}
-	if (samples.length === 0) return null;
-
-	const stat = (key: keyof Omit<UsageSample, "t" | "n">): UsageStat | null => {
-		const vals: Array<{ t: number; v: number }> = [];
-		for (const s of samples) {
-			const v = s[key];
-			if (typeof v === "number") vals.push({ t: s.t, v });
-		}
-		if (vals.length === 0) return null;
-		const vs = vals.map((x) => x.v);
-		const max = Math.max(...vs);
-		const peakAt = vals.find((x) => x.v === max)!.t;
-		const avg = vs.reduce((a, b) => a + b, 0) / vs.length;
-		const half = Math.floor(vals.length / 2);
-		const a1 = vals.slice(0, half).reduce((a, b) => a + b.v, 0) / Math.max(1, half);
-		const a2 = vals.slice(half).reduce((a, b) => a + b.v, 0) / Math.max(1, vals.length - half);
-		const trend = a2 > a1 * 1.25 ? "rising" : a2 < a1 * 0.75 ? "falling" : "flat";
-		return { min: Math.min(...vs), max, avg: Math.round(avg * 10) / 10, peakAt, trend };
-	};
-
-	return {
-		count: samples.length,
-		procs: samples[samples.length - 1].n,
-		windowMin,
-		file,
-		samples: samples.slice(-maxSamples),
-		cpu: stat("cpu"),
-		rss_mb: stat("rss_mb"),
-		gpu: stat("gpu"),
-		vram_mb: stat("vram_mb"),
-	};
-}
-
-/** One-line resource summary for exit callbacks (non-zero exits). */
-export function usageSummaryLine(t: TaskEntry, windowMin = 30): string | null {
-	const r = usageReport(t, windowMin, 1);
-	if (!r) return null;
 	const parts: string[] = [];
-	if (r.cpu) parts.push(`cpu peak ${r.cpu.max}%`);
-	if (r.rss_mb) parts.push(`rss peak ${r.rss_mb.max}MB (${r.rss_mb.trend})`);
-	if (r.gpu) parts.push(`gpu peak ${r.gpu.max}%`);
-	if (r.vram_mb) parts.push(`vram peak ${r.vram_mb.max}MB`);
+	if (cpuMax !== null) parts.push(`cpu peak ${Math.round(cpuMax)}%`);
+	if (rssMax !== null) parts.push(`rss peak ${Math.round(rssMax)}MB`);
+	if (gpuMax !== null) parts.push(`gpu peak ${Math.round(gpuMax)}%`);
+	if (vramMax !== null) parts.push(`vram peak ${Math.round(vramMax)}MB`);
 	if (parts.length === 0) parts.push("gpu/vram n/a");
 	return parts.join(" · ");
 }

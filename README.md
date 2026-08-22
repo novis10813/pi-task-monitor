@@ -10,14 +10,10 @@ degrades CPU sampling to lifetime averages).
   process. It keeps running when pi is closed, killed, or the machine reboots
   (well: when pi is closed — the process is reparented to init). Output goes to
   a per-task log; the real exit code **and exit time** go to a sidecar file.
-- **`monitor`** — inspect tasks:
-  - `status` (all, or one with recent output)
-  - `tail` (last N lines of the log)
-  - `usage` (CPU / RAM / GPU / VRAM stats + raw samples)
-  - `wait` (block until exit or timeout; Esc interrupts)
-  - `kill` (SIGTERM the whole process group, escalate to SIGKILL after 5s)
-- **`/tasks`** — TUI panel: list, detail + live tail (`l`), kill (`k`, confirm),
-  log path (`c`).
+- **`kill_background`** — stop a task: SIGTERM the whole process group,
+  escalate to SIGKILL after 5s. No completion notice is sent for a killed task.
+- **`/tasks`** — TUI panel (for the human): list, detail + live tail (`l`),
+  kill (`k`, confirm), log path (`c`).
 - **Exit callback** — when a tracked task exits (code 0 or not), the agent is
   woken with a `[task-event]` message: state, exit code, duration, log tail,
   and — for non-zero exits — a resource-usage peak line (helps diagnose OOM /
@@ -25,9 +21,14 @@ degrades CPU sampling to lifetime averages).
 - **Recovery report** — if tasks exited while no pi session was open, the next
   `session_start` injects a `[task-event recovery]` message into the agent's
   first turn, listing what happened.
-- **Footer** — while tasks run, the status bar shows `N running · M done`.
-- **Prune** — terminal tasks older than 7 days are cleaned at session start
-  (registry entry + log/exit/usage/claim files). Running tasks are never pruned.
+- **Footer** — while tasks run, the status bar shows `N running` (cleared when
+  nothing is running; finished tasks stay queryable in the `/tasks` panel until
+  the 7-day prune).
+- **Prune** — two-tier: a terminal task is removed (registry entry + log/exit/
+  usage/claim files) on the tick after its transition was delivered to the
+  agent; the 7-day age-based prune remains as a fallback for tasks spawned
+  with `callback=false`, which are never delivered. Running tasks are never
+  pruned.
 
 ## Why this design (the two gaps it fills)
 
@@ -62,8 +63,9 @@ runs in a **subshell** so a user `exit N` can't skip the sidecar write.
 - **Callback delivery is at-most-once, never duplicated.** Each task's
   transition is claimed (`O_EXCL` file, safe across pi processes), watermarked
   in the registry (durably, before the message is sent), then sent; a crash in
-  the save→send window loses that one notification, but the final state always
-  remains visible via `monitor(status)` / `/tasks` — and the next session start
+  the save→send window loses that one notification, and with it the task's
+  record (delivered-looking tasks are pruned). The `/tasks` panel shows a task
+  until it is delivered or aged out — and the next session start
   re-reports it as recovery if the watermark was never written.
 - **Cancelled tasks never notify** (an explicit stop isn't news); the
   suppression is durable via the watermark.
@@ -74,7 +76,7 @@ runs in a **subshell** so a user `exit N` can't skip the sidecar write.
   (in-process mutex + O_EXCL file lock with 2s stale-break, fresh read →
   mutate → atomic tmp+rename save). Two pi sessions on one project are safe.
 - **Poller cost:** one 3s tick per project while tasks run; self-stops when
-  idle; `monitor(status)`/`session_start` also settle, so state never lags
+  idle; `session_start` also settles, so state never lags
   more than one tick when something is alive.
 - **GPU:** `nvidia-smi` auto-detected once per process; absent ⇒
   `gpu`/`vram` are `null` with zero overhead (AMD/ROCm is out of scope for v1).
@@ -89,7 +91,7 @@ runs in a **subshell** so a user `exit N` can't skip the sidecar write.
 | `registry.ts` | disk registry: atomic save, probe, single-writer lock |
 | `spawner.ts` | detached spawn, wrapper, `killGroup`, `cancelTask` |
 | `poller.ts` | `settleRegistry` (the only state-transition code), 3s heartbeat, prune |
-| `usage.ts` | /proc CPU (jiffies Δ) + RSS, nvidia-smi GPU%/VRAM, JSONL sampling/reports |
+| `usage.ts` | /proc CPU (jiffies Δ) + RSS, nvidia-smi GPU%/VRAM, JSONL sampling, exit-callback resource summary |
 | `delivery.ts` | claim + watermark + send (exactly-once-ish), recovery message builder |
 | `format.ts` | display helpers (durations, labels, colors, footer) |
 
@@ -97,7 +99,8 @@ runs in a **subshell** so a user `exit N` can't skip the sidecar write.
 
 - Type-check: `tsc -p tsconfig.json` (paths point at the installed pi dist).
 - Smoke test (mock pi, no LLM): `/tmp/tm-spike/smoke.mjs` — 41 checks covering
-  spawn, callbacks, recovery, wait/kill, prune, cross-tick concurrency.
+  spawn, callbacks, recovery, kill, prune, cross-tick concurrency. (Written for
+  the pre-v1 tool set; the `monitor`-tool checks no longer apply.)
 - Runtime deps: none (pure Node ≥ 22.19 builtins). Loaded by pi's jiti with the
   standard `@earendil-works/*` + `typebox` aliases.
 

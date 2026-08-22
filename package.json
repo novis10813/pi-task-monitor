@@ -3,7 +3,7 @@
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
-	"description": "pi extension: durable background process tracking (spawn_background + monitor, survives pi restarts, exit callbacks, resource usage history)",
+	"description": "pi extension: durable background process tracking (spawn_background + kill_background, survives pi restarts, exit callbacks, resource usage history)",
 	"engines": {
 		"node": ">=22.19.0"
 	}

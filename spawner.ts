@@ -140,7 +140,7 @@ export async function killGroup(pid: number, graceMs = 5000): Promise<"term" | "
  * persistent callback suppression — a kill is never news), then SIGTERM the
  * process group. A crash in between is healed by the settle reaper, which
  * re-kills any survivor of a cancelled task.
- * Shared by monitor(kill) and the /tasks panel.
+ * Shared by kill_background and the /tasks panel.
  */
 export async function cancelTask(cwd: string, id: string): Promise<CancelResult> {
 	const marked = await withRegistryLock(cwd, (reg) => {

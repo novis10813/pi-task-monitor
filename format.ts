@@ -37,11 +37,7 @@ export function stateColor(t: TaskEntry): ThemeColor {
 }
 
 export function footerText(tasks: TaskEntry[]): string | undefined {
-	if (tasks.length === 0) return undefined;
 	const running = tasks.filter((t) => t.state === "running").length;
-	const done = tasks.length - running;
-	const parts: string[] = [];
-	if (running) parts.push(`${running} running`);
-	if (done) parts.push(`${done} done`);
-	return parts.join(" · ");
+	if (running === 0) return undefined;
+	return `${running} running`;
 }

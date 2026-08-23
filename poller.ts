@@ -176,9 +176,9 @@ const PRUNE_MAX_AGE_MS = 7 * 24 * 3600 * 1000; // 7 days
 
 function removeTaskFiles(cwd: string, t: TaskEntry): void {
 	const dir = tasksDir(cwd);
-	const files = [t.exitFile, usageFileFor(t), `${usageFileFor(t)}.prev`, join(dir, `${t.id}.claim`)];
-	// Caller-owned append-mode logs (`log_file`) survive the task.
-	if (!t.persistentLog) files.unshift(t.log);
+	// t.log is always the managed log; a caller-owned outputFile (if any) is
+	// never touched here.
+	const files = [t.log, t.exitFile, usageFileFor(t), `${usageFileFor(t)}.prev`, join(dir, `${t.id}.claim`)];
 	for (const f of files) {
 		try {
 			unlinkSync(f);

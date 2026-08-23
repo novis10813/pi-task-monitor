@@ -45,11 +45,15 @@ export function shellQuote(s: string): string {
  * restart (detection time would otherwise overstate the duration).
  */
 function spawnWrapper(entry: TaskEntry): number {
-	const redirect = entry.persistentLog ? ">>" : ">";
+	// With outputFile: tee output into it (append) while the managed log stays
+	// the primary record. pipefail keeps $? == the command's exit code.
+	const run = entry.outputFile
+		? `set -o pipefail && ( ${entry.command} ) 2>&1 | tee -a ${shellQuote(entry.outputFile)} > ${shellQuote(entry.log)}`
+		: `( ${entry.command} ) > ${shellQuote(entry.log)} 2>&1`;
 	const wrapper =
 		`cd ${shellQuote(entry.cwd)} && ` +
-		`( ${entry.command} ) ${redirect} ${shellQuote(entry.log)} 2>&1; ` +
-		`printf "%s %s\\n" $? "$(date +%s)" > ${shellQuote(entry.exitFile)}`;
+		run +
+		`; printf "%s %s\\n" $? "$(date +%s)" > ${shellQuote(entry.exitFile)}`;
 	const child = spawn("bash", ["-lc", wrapper], { detached: true, stdio: "ignore" });
 	child.unref();
 	if (child.pid === undefined) throw new Error("spawn failed: no pid returned");
@@ -79,7 +83,7 @@ export async function spawnTask(
 			command,
 			cwd,
 			pid: 0,
-			log: opts.logFile ?? join(dir, `${id}.log`),
+			log: join(dir, `${id}.log`),
 			exitFile: join(dir, `${id}.exit`),
 			createdAt: Date.now(),
 			timeoutSeconds: opts.timeoutSeconds ?? null,
@@ -89,7 +93,7 @@ export async function spawnTask(
 			endedAt: null,
 			logBytes: 0,
 			reported: { state: "running", logBytes: 0 },
-			persistentLog: opts.logFile !== undefined,
+			outputFile: opts.logFile,
 		};
 		reg.tasks.push(entry);
 	});

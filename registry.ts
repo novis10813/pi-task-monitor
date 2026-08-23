@@ -39,8 +39,8 @@ export interface TaskEntry {
 	logBytes: number;
 	/** Watermark: last state the agent has been told about. Callbacks fire only on transitions past this. */
 	reported: { state: TaskState; logBytes: number };
-	/** When true, `log` is caller-owned (append mode, `>>`); pruning must not delete it. */
-	persistentLog?: boolean;
+	/** When set, output is ALSO appended (`tee -a`) to this caller-owned file; never pruned. */
+	outputFile?: string;
 }
 
 export interface Registry {

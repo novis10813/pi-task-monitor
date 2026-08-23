@@ -284,7 +284,7 @@ export default function (pi: ExtensionAPI) {
 			cwd: Type.Optional(Type.String({ description: "Working directory (default: current session cwd)" })),
 			timeout_seconds: Type.Optional(Type.Number({ description: "Kill the task after this many seconds (optional; no default)" })),
 			callback: Type.Optional(Type.Boolean({ description: "Wake the agent when the task exits (default: true)" })),
-			log_file: Type.Optional(Type.String({ description: "Persistent output file, appended to (`>>` semantics) and never auto-deleted — output accumulates across runs. Default: managed log in .pi/tasks/ that is cleaned up after reporting." })),
+			log_file: Type.Optional(Type.String({ description: "Mirror output file (absolute, or relative to the task cwd): output is appended there via tee, in real time, and the file is never auto-deleted — it accumulates across runs. The managed .pi/tasks/ log remains the primary record. Default: managed log only." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const cwd = params.cwd ? resolve(ctx.cwd, params.cwd.replace(/^@/, "")) : ctx.cwd;
@@ -329,7 +329,9 @@ export default function (pi: ExtensionAPI) {
 				params.callback === false
 					? "No exit notification will be sent (callback: false) — read the log to check on it."
 					: "You will be notified when it exits (code + output tail).";
-			const persistNote = logFile ? " Output appends to this file across runs; it is never auto-deleted." : "";
+			const persistNote = logFile
+				? ` Output is also appended (tee) to ${logFile}; that file accumulates across runs and is never auto-deleted.`
+				: "";
 			const text =
 				entry.state === "running"
 					? [

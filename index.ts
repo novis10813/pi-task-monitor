@@ -16,8 +16,8 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { Type } from "typebox";
 import {
 	loadRegistry,
@@ -284,10 +284,16 @@ export default function (pi: ExtensionAPI) {
 			cwd: Type.Optional(Type.String({ description: "Working directory (default: current session cwd)" })),
 			timeout_seconds: Type.Optional(Type.Number({ description: "Kill the task after this many seconds (optional; no default)" })),
 			callback: Type.Optional(Type.Boolean({ description: "Wake the agent when the task exits (default: true)" })),
+			log_file: Type.Optional(Type.String({ description: "Persistent output file, appended to (`>>` semantics) and never auto-deleted — output accumulates across runs. Default: managed log in .pi/tasks/ that is cleaned up after reporting." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const cwd = params.cwd ? resolve(ctx.cwd, params.cwd.replace(/^@/, "")) : ctx.cwd;
 			if (!existsSync(cwd)) throw new Error(`cwd does not exist: ${cwd}`);
+			let logFile: string | undefined;
+			if (params.log_file) {
+				logFile = resolve(cwd, params.log_file.replace(/^@/, ""));
+				mkdirSync(dirname(logFile), { recursive: true });
+			}
 			let entry: TaskEntry;
 			try {
 				// spawnTask: reserves the registry entry under the lock, spawns the
@@ -297,6 +303,7 @@ export default function (pi: ExtensionAPI) {
 					name: params.name,
 					timeoutSeconds: params.timeout_seconds ?? null,
 					callback: params.callback ?? true,
+					logFile,
 				});
 			} catch (e) {
 				throw new Error(`spawn failed: ${(e as Error).message}`);
@@ -318,12 +325,17 @@ export default function (pi: ExtensionAPI) {
 			ensurePoller(cwd, makeDeliveryCtx(pi, ctx, false));
 
 			const id = entry.id;
+			const notify =
+				params.callback === false
+					? "No exit notification will be sent (callback: false) — read the log to check on it."
+					: "You will be notified when it exits (code + output tail).";
+			const persistNote = logFile ? " Output appends to this file across runs; it is never auto-deleted." : "";
 			const text =
 				entry.state === "running"
 					? [
 							`Task ${id} "${entry.name}" started (pid ${entry.pid}).`,
-							`Log: ${entry.log}`,
-							`You will be notified when it exits (code + output tail).`,
+							`Log: ${entry.log}.${persistNote}`,
+							notify,
 						].join("\n")
 					: [
 							`Task ${id} "${entry.name}" exited instantly with code ${entry.exitCode ?? "unknown"}`,

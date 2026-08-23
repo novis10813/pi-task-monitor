@@ -45,9 +45,10 @@ export function shellQuote(s: string): string {
  * restart (detection time would otherwise overstate the duration).
  */
 function spawnWrapper(entry: TaskEntry): number {
+	const redirect = entry.persistentLog ? ">>" : ">";
 	const wrapper =
 		`cd ${shellQuote(entry.cwd)} && ` +
-		`( ${entry.command} ) > ${shellQuote(entry.log)} 2>&1; ` +
+		`( ${entry.command} ) ${redirect} ${shellQuote(entry.log)} 2>&1; ` +
 		`printf "%s %s\\n" $? "$(date +%s)" > ${shellQuote(entry.exitFile)}`;
 	const child = spawn("bash", ["-lc", wrapper], { detached: true, stdio: "ignore" });
 	child.unref();
@@ -63,7 +64,7 @@ function spawnWrapper(entry: TaskEntry): number {
 export async function spawnTask(
 	cwd: string,
 	command: string,
-	opts: { name?: string; timeoutSeconds?: number | null; callback: boolean },
+	opts: { name?: string; timeoutSeconds?: number | null; callback: boolean; logFile?: string },
 ): Promise<TaskEntry> {
 	const dir = tasksDir(cwd);
 	mkdirSync(dir, { recursive: true });
@@ -78,7 +79,7 @@ export async function spawnTask(
 			command,
 			cwd,
 			pid: 0,
-			log: join(dir, `${id}.log`),
+			log: opts.logFile ?? join(dir, `${id}.log`),
 			exitFile: join(dir, `${id}.exit`),
 			createdAt: Date.now(),
 			timeoutSeconds: opts.timeoutSeconds ?? null,
@@ -88,6 +89,7 @@ export async function spawnTask(
 			endedAt: null,
 			logBytes: 0,
 			reported: { state: "running", logBytes: 0 },
+			persistentLog: opts.logFile !== undefined,
 		};
 		reg.tasks.push(entry);
 	});

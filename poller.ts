@@ -102,7 +102,9 @@ export async function runTick(cwd: string, dc: DeliveryCtx): Promise<void> {
 export function buildExitMessage(claimed: TaskEntry[]): string {
 	const lines: string[] = ["[task-event] Background process update:"];
 	for (const t of claimed) {
-		lines.push(`• "${t.name}" (${t.id}) ${t.state === "exited" ? (t.exitCode === 0 ? "SUCCEEDED" : "FAILED") : t.state} with code ${t.state === "exited" ? t.exitCode ?? "unknown" : "-"} after ${fmtDur((t.endedAt ?? Date.now()) - t.createdAt)}`);
+		const verb = t.state === "exited" ? (t.exitCode === 0 ? "SUCCEEDED" : "FAILED") : t.state.toUpperCase();
+		const codePart = t.state === "exited" ? ` with code ${t.exitCode ?? "unknown"}` : "";
+		lines.push(`• "${t.name}" (${t.id}) ${verb}${codePart} after ${fmtDur((t.endedAt ?? Date.now()) - t.createdAt)}`);
 		lines.push(`  log: ${t.log} (${logSize(t.log)} bytes)`);
 		const tail = tailLines(t, 5);
 		if (tail) lines.push("  last output:");
@@ -174,7 +176,10 @@ const PRUNE_MAX_AGE_MS = 7 * 24 * 3600 * 1000; // 7 days
 
 function removeTaskFiles(cwd: string, t: TaskEntry): void {
 	const dir = tasksDir(cwd);
-	for (const f of [t.log, t.exitFile, usageFileFor(t), `${usageFileFor(t)}.prev`, join(dir, `${t.id}.claim`)]) {
+	const files = [t.exitFile, usageFileFor(t), `${usageFileFor(t)}.prev`, join(dir, `${t.id}.claim`)];
+	// Caller-owned append-mode logs (`log_file`) survive the task.
+	if (!t.persistentLog) files.unshift(t.log);
+	for (const f of files) {
 		try {
 			unlinkSync(f);
 		} catch {

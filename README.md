@@ -9,7 +9,8 @@ degrades CPU sampling to lifetime averages).
 - **`spawn_background`** — start a long-running shell command as a *detached*
   process. It keeps running when pi is closed, killed, or the machine reboots
   (well: when pi is closed — the process is reparented to init). Output goes to
-  a per-task log; the real exit code **and exit time** go to a sidecar file.
+  a per-task log (or to a caller-provided `log_file`, see below); the real
+  exit code **and exit time** go to a sidecar file.
 - **`kill_background`** — stop a task: SIGTERM the whole process group,
   escalate to SIGKILL after 5s. No completion notice is sent for a killed task.
 - **`/tasks`** — TUI panel (for the human): list, detail + live tail (`l`),
@@ -29,6 +30,11 @@ degrades CPU sampling to lifetime averages).
   agent; the 7-day age-based prune remains as a fallback for tasks spawned
   with `callback=false`, which are never delivered. Running tasks are never
   pruned.
+- **Persistent log (`log_file`)** — pass a path (absolute, or relative to the
+  task `cwd`; parent dirs are created) and output is **appended** there with
+  `>>` semantics instead of a managed per-task log. The file accumulates
+  across runs and is never pruned; only the registry/exit/usage/claim files
+  are cleaned up.
 
 ## Why this design (the two gaps it fills)
 
@@ -51,8 +57,10 @@ task-monitor's source of truth is **on disk** (`<project>/.pi/tasks/`):
 Mechanism per task:
 
 ```
-bash -lc 'cd <cwd> && ( <command> ) > <log> 2>&1; printf "%s %s\n" $? "$(date +%s)" > <exit>'
+bash -lc 'cd <cwd> && ( <command> ) {>,>>} <log> 2>&1; printf "%s %s\n" $? "$(date +%s)" > <exit>'
 ```
+
+(`>` for the default managed log, `>>` when `log_file` is set.)
 
 spawned with `detached: true` + `unref()`. Bash becomes the process-group
 leader, so `kill(-pid)` stops the whole tree (npm -> node -> ...). The command

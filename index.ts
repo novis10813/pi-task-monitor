@@ -371,7 +371,7 @@ export default function (pi: ExtensionAPI) {
 			"Stop a background process started with spawn_background. SIGTERM the whole process group, escalate to SIGKILL after a grace period. No completion notice is sent for a killed task.",
 		promptSnippet: "Stop a background process",
 		promptGuidelines: [
-			"Use this only when you know the task must stop (e.g. wrong command, resource problem); otherwise let it finish and rely on the exit callback.",
+			"Use kill_background only when you know the task must stop (e.g. wrong command, resource problem); otherwise let it finish and rely on the exit callback.",
 		],
 		parameters: Type.Object({
 			task_id: Type.String({ description: "Task id from spawn_background" }),

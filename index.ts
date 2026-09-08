@@ -15,7 +15,7 @@ import {
 	type ExtensionContext,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { matchesKey, Text, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { Type } from "typebox";
@@ -76,6 +76,12 @@ function refreshCtx(ctx: ExtensionContext): TaskEntry[] {
 // /tasks panel
 // ---------------------------------------------------------------------------
 
+// The panel is a live view of the on-disk registry: while it is open, tasks
+// can be killed (here or by the agent), settled, or pruned by the poller, so
+// the list re-reads the registry on a short timer instead of showing a stale
+// snapshot.
+const PANEL_REFRESH_MS = 2_000;
+
 class TasksPanel {
 	private view: "list" | "detail" = "list";
 	private sel = 0;
@@ -86,19 +92,33 @@ class TasksPanel {
 	private tasks: TaskEntry[] = [];
 	private cachedWidth?: number;
 	private cachedLines?: string[];
+	private refreshTimer?: NodeJS.Timeout;
 
 	constructor(
 		private cwd: string,
 		private theme: Theme,
+		private tui: TUI,
 		private onClose: () => void,
 		private notify: (m: string, k: "info" | "warning" | "error") => void,
 		private onRefresh: () => void,
 	) {
 		this.load();
+		this.refreshTimer = setInterval(() => this.refresh(), PANEL_REFRESH_MS);
 	}
 
 	private load(): void {
 		this.tasks = snapshotRegistry(this.cwd).tasks;
+	}
+
+	/** Re-read the registry and force a re-render of this (open) panel. */
+	private refresh(): void {
+		this.load();
+		this.invalidate();
+		this.tui.requestRender();
+	}
+
+	dispose(): void {
+		clearInterval(this.refreshTimer);
 	}
 
 	invalidate(): void {
@@ -172,6 +192,7 @@ class TasksPanel {
 
 	private async kill(id: string): Promise<void> {
 		const r = await cancelTask(this.cwd, id);
+		this.refresh(); // list must not keep showing the just-killed task
 		this.onRefresh();
 		if (r.ok) this.notify(`task ${id} "${r.name}" stopped (${r.outcome})`, "info");
 		else this.notify(r.error, "warning");
@@ -405,10 +426,11 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("/tasks requires interactive mode", "error");
 				return;
 			}
-			await ctx.ui.custom<void>((_tui, theme, _kb, done) =>
+			await ctx.ui.custom<void>((tui, theme, _kb, done) =>
 				new TasksPanel(
 					ctx.cwd,
 					theme,
+					tui,
 					done,
 					(m, k) => ctx.ui.notify(m, k),
 					() => refreshCtx(ctx),

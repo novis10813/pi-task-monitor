@@ -291,13 +291,13 @@ export default function (pi: ExtensionAPI) {
 		name: "spawn_background",
 		label: "Spawn Background",
 		description:
-			"Start a long-running shell command as a tracked background process. Non-blocking: returns immediately with a task id. The process keeps running even if pi is closed; output and exit code are stored in <cwd>/.pi/tasks/. Use for commands expected to run longer than a few minutes (dev servers, long builds, watchers, migrations). Use bash for short commands.",
+			"Start a long-running shell command as a tracked background process. Non-blocking: returns immediately with a task id; completion later arrives as a message that wakes a new turn, so do not sleep to wait for it. The process keeps running even if pi is closed; output and exit code are stored in <cwd>/.pi/tasks/. Use for commands expected to run longer than a few minutes (dev servers, long builds, watchers, migrations). Use bash for short commands.",
 		promptSnippet: "Spawn a long-running shell command as a tracked background process (non-blocking)",
 		promptGuidelines: [
 			"Use spawn_background (not bash) for commands expected to run longer than a few minutes or that must outlive this session (dev servers, long builds, watchers, migrations).",
 			"spawn_background is for long-running shell processes; use task-planning tools (e.g. TaskCreate) for multi-step work plans — do not conflate the two.",
-			"You will be notified via callback when the task exits; use /tasks (TUI) to inspect manually.",
-			"Never poll background processes with bash sleep loops.",
+			"Task completion arrives automatically as a message that wakes a new turn — with the exit code and output tail — even if you end this one. That is the only correct way to wait for it: do not sleep, loop, or re-check.",
+			"After spawning: either continue with work that does not depend on its result, or end the turn with a one-line status. Ending the turn is expected behavior, not abandonment — the callback resumes you.",
 		],
 		parameters: Type.Object({
 			command: Type.String({ description: "Shell command to run (executed via bash -lc in a subshell; stdout+stderr go to a log file)" }),

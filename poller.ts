@@ -24,7 +24,7 @@ import { killGroup } from "./spawner.js";
 import { sampleUsage, usageFileFor, usageSummaryLine } from "./usage.js";
 import { deliverEvents, hasClaim, type DeliveryCtx } from "./delivery.js";
 import { forgetTask } from "./usage.js";
-import { fmtDur, footerText } from "./format.js";
+import { fmtDur } from "./format.js";
 
 const POLL_INTERVAL_MS = 3_000;
 const LOG_HARD_CAP_BYTES = 20 * 1024 * 1024;
@@ -92,7 +92,9 @@ export async function runTick(cwd: string, dc: DeliveryCtx): Promise<void> {
 		await deliverEvents(cwd, due, dc, buildExitMessage);
 	}
 	await pruneDelivered(cwd);
-	dc.setFooter(footerText(registry.tasks));
+	// The block re-reads the registry at render time; the tick only drives
+	// re-renders (live durations) and the flash-expiry timer (via the ctx).
+	dc.notifyFooter();
 }
 
 /**

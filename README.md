@@ -22,9 +22,14 @@ degrades CPU sampling to lifetime averages).
 - **Recovery report** — if tasks exited while no pi session was open, the next
   `session_start` injects a `[task-event recovery]` message into the agent's
   first turn, listing what happened.
-- **Footer** — while tasks run, the status bar shows `N running` (cleared when
-  nothing is running; finished tasks stay queryable in the `/tasks` panel until
-  the 7-day prune).
+- **Footer** — a footer-bus detail block (rendered by `footer-composer`,
+  same mechanism as the subagent footer): running tasks with live durations
+  (3s poller ticks drive re-renders), plus a 3s flash for tasks that just
+  terminated (`✓`/`✗` + exit code, `⚠` for timeout/log-overflow). `cancelled`
+  never shows (an explicit stop is not news). Wide terminals get one row per
+  task (max 4 + `… +N more`); narrow (<48 cols) collapse to a single summary
+  line. Nothing running / nothing just finished → no block. Details and
+  killing stay in `/tasks`.
 - **Prune** — two-tier: a terminal task is removed (registry entry + log/exit/
   usage/claim files) on the tick after its transition was delivered to the
   agent; the 7-day age-based prune remains as a fallback for tasks spawned
@@ -103,7 +108,7 @@ runs in a **subshell** so a user `exit N` can't skip the sidecar write.
 | `poller.ts` | `settleRegistry` (the only state-transition code), 3s heartbeat, prune |
 | `usage.ts` | /proc CPU (jiffies Δ) + RSS, nvidia-smi GPU%/VRAM, JSONL sampling, exit-callback resource summary |
 | `delivery.ts` | claim + watermark + send (exactly-once-ish), recovery message builder |
-| `format.ts` | display helpers (durations, labels, colors, footer) |
+| `format.ts` | display helpers (durations, labels, colors, footer block renderer) |
 
 ## Development
 

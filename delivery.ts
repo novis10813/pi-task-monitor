@@ -25,7 +25,8 @@ import { usageSummaryLine } from "./usage.js";
 export interface DeliveryCtx {
 	sendMessage: (content: string, details: unknown) => Promise<void> | void;
 	notify: (msg: string, kind: "info" | "warning" | "error") => void;
-	setFooter: (text: string | undefined) => void;
+	/** Ask the UI to re-render the footer block (footer-bus detail). */
+	notifyFooter: () => void;
 }
 
 const MAX_SEND_RETRIES = 3;

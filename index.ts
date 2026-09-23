@@ -28,7 +28,8 @@ import {
 	withRegistryLock,
 } from "./registry.js";
 import { cancelTask, spawnTask } from "./spawner.js";
-import { durationOf, footerText, stateColor, stateLabel } from "./format.js";
+import { durationOf, stateColor, stateLabel, renderTaskBlock, FINISH_FLASH_MS } from "./format.js";
+import { notifyFooterDetailChange, registerFooterDetail } from "../shared/footer-bus.js";
 import { buildRecoveryMessage, clearStaleClaims, deliverEvents, type DeliveryCtx } from "./delivery.js";
 import { ensurePoller, pruneDelivered, pruneOld, settleRegistry, stopPollerFor } from "./poller.js";
 
@@ -60,14 +61,45 @@ function makeDeliveryCtx(pi: ExtensionAPI, ctx: ExtensionContext, recovery = fal
 		notify: (m, k) => {
 			if (ctx.hasUI) ctx.ui.notify(m, k);
 		},
-		setFooter: (text) => ctx.ui.setStatus("task-monitor", text),
+		notifyFooter: () => refreshFooter(ctx),
 	};
 }
 
-function refreshCtx(ctx: ExtensionContext): TaskEntry[] {
-	const registry = snapshotRegistry(ctx.cwd);
-	ctx.ui.setStatus("task-monitor", footerText(registry.tasks));
-	return registry.tasks;
+/**
+ * Refresh the footer-bus detail block after a state-affecting event. The block
+ * re-reads the on-disk registry at render time, so there is no state to sync —
+ * we only request a re-render (and arm the flash-expiry timer).
+ */
+function refreshFooter(ctx: ExtensionContext): void {
+	if (!ctx.hasUI) return;
+	notifyFooterDetailChange();
+	scheduleFlashExpiry(ctx.cwd);
+}
+
+/**
+ * Self-cleaning timer so a just-finished row leaves the footer when its
+ * 3s flash window closes, even when the poller has already stopped (nothing
+ * running) and nothing else triggers a re-render. Re-armed from
+ * refreshFooter on every state-affecting event; the latest terminal `endedAt`
+ * decides the delay (registry read is a small JSON, same as the /tasks panel).
+ */
+let flashExpiryTimer: ReturnType<typeof setTimeout> | undefined;
+
+function scheduleFlashExpiry(cwd: string): void {
+	if (flashExpiryTimer) {
+		clearTimeout(flashExpiryTimer);
+		flashExpiryTimer = undefined;
+	}
+	const latestEnd = snapshotRegistry(cwd).tasks
+		.filter((t) => t.state !== "running" && t.state !== "cancelled")
+		.reduce((max, t) => Math.max(max, t.endedAt ?? t.createdAt), 0);
+	const delay = latestEnd + FINISH_FLASH_MS - Date.now();
+	if (delay <= 0) return;
+	flashExpiryTimer = setTimeout(() => {
+		flashExpiryTimer = undefined;
+		notifyFooterDetailChange();
+	}, delay + 100);
+	flashExpiryTimer.unref();
 }
 
 
@@ -253,8 +285,18 @@ class TasksPanel {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	let unregisterFooterDetail: (() => void) | undefined;
+	let footerDetailContext: ExtensionContext | undefined;
+
 	pi.on("session_start", async (_event, ctx) => {
 		const recoveryDc = makeDeliveryCtx(pi, ctx, true); // recovery mode (nextTurn)
+		if (ctx.hasUI) {
+			unregisterFooterDetail = registerFooterDetail({
+				id: "task-monitor",
+				render: ({ width, theme }) => renderTaskBlock(snapshotRegistry(ctx.cwd).tasks, width, theme),
+			});
+			footerDetailContext = ctx;
+		}
 		try {
 			const registry = await settleRegistry(ctx.cwd);
 			clearStaleClaims(ctx.cwd, registry.tasks);
@@ -273,7 +315,7 @@ export default function (pi: ExtensionAPI) {
 			// Delivered terminal tasks are disposable now; also sweeps leftovers
 			// from sessions where the poller stopped before pruning.
 			await pruneDelivered(ctx.cwd);
-			recoveryDc.setFooter(footerText(snapshotRegistry(ctx.cwd).tasks));
+			recoveryDc.notifyFooter();
 		} catch (e) {
 			if (ctx.hasUI) ctx.ui.notify(`task-monitor: recovery failed: ${(e as Error).message}`, "error");
 		}
@@ -285,6 +327,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		stopPollerFor(ctx.cwd); // tasks are intentionally durable — never killed here
+		if (ctx.hasUI && footerDetailContext === ctx) {
+			unregisterFooterDetail?.();
+			unregisterFooterDetail = undefined;
+			footerDetailContext = undefined;
+		}
 	});
 
 	pi.registerTool({
@@ -342,7 +389,7 @@ export default function (pi: ExtensionAPI) {
 				entry = loadRegistry(cwd).tasks.find((x) => x.id === entry.id)!;
 				void pruneDelivered(cwd).catch(() => {}); // tool result was the notification
 			}
-			refreshCtx(ctx);
+			refreshFooter(ctx);
 			ensurePoller(cwd, makeDeliveryCtx(pi, ctx, false));
 
 			const id = entry.id;
@@ -400,7 +447,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const r = await cancelTask(ctx.cwd, params.task_id);
 			if (!r.ok) throw new Error(r.error);
-			refreshCtx(ctx);
+			refreshFooter(ctx);
 			return {
 				content: [{ type: "text", text: `Task ${params.task_id} "${r.name}" stopped (${r.outcome}). No completion notice will be sent for it.` }],
 				details: { id: params.task_id, outcome: r.outcome },
@@ -433,10 +480,10 @@ export default function (pi: ExtensionAPI) {
 					tui,
 					done,
 					(m, k) => ctx.ui.notify(m, k),
-					() => refreshCtx(ctx),
+					() => refreshFooter(ctx),
 				),
 			);
-			refreshCtx(ctx);
+			refreshFooter(ctx);
 		},
 	});
 }

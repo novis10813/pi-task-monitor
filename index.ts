@@ -30,8 +30,9 @@ import {
 import { cancelTask, spawnTask } from "./spawner.js";
 import { durationOf, stateColor, stateLabel, renderTaskBlock, FINISH_FLASH_MS } from "./format.js";
 import { notifyFooterDetailChange, registerFooterDetail } from "../shared/footer-bus.js";
-import { buildRecoveryMessage, clearStaleClaims, deliverEvents, type DeliveryCtx } from "./delivery.js";
-import { ensurePoller, pruneDelivered, pruneOld, settleRegistry, stopPollerFor } from "./poller.js";
+import { buildRecoveryMessage, clearStaleClaims, deliverEvents, discardPending, type DeliveryCtx } from "./delivery.js";
+import { attachPoller, ensurePoller, pruneDelivered, pruneOld, settleRegistry, stopPollerFor } from "./poller.js";
+import { SessionOwnership } from "./ownership.js";
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -49,15 +50,21 @@ import { ensurePoller, pruneDelivered, pruneOld, settleRegistry, stopPollerFor }
  *   triggering. Using triggerTurn here races the CLI `-p` prompt in print mode
  *   (prompt() throws "Agent is already processing") and is noisy in TUI.
  */
-function makeDeliveryCtx(pi: ExtensionAPI, ctx: ExtensionContext, recovery = false): DeliveryCtx {
+function makeDeliveryCtx(pi: ExtensionAPI, ctx: ExtensionContext, ownership: SessionOwnership, sessionId: string, recovery = false): DeliveryCtx {
+	const isCurrent = () => ownership.current(ctx.cwd, sessionId) && ctx.sessionManager.getSessionId() === sessionId;
 	return {
+		isCurrent,
+		belongsToSession: (task) => ownership.belongsToSession(task, sessionId),
+		canDeliver: (task) => isCurrent() && ownership.canDeliver(ctx.cwd, task, sessionId),
 		// Awaiting the send matters: failures (e.g. session ending mid-send)
 		// must be observed by the delivery retry logic, not become unhandled.
-		sendMessage: (content, details) =>
-			pi.sendMessage(
+		sendMessage: (content, details) => {
+			if (!isCurrent()) throw new Error("task-monitor: session changed before delivery");
+			return pi.sendMessage(
 				{ customType: recovery ? "task-event-recovery" : "task-event", content, display: true, details },
 				recovery ? { deliverAs: "nextTurn" } : { deliverAs: "steer", triggerTurn: true },
-			),
+			);
+		},
 		notify: (m, k) => {
 			if (ctx.hasUI) ctx.ui.notify(m, k);
 		},
@@ -285,11 +292,18 @@ class TasksPanel {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	const ownership = new SessionOwnership();
 	let unregisterFooterDetail: (() => void) | undefined;
 	let footerDetailContext: ExtensionContext | undefined;
 
 	pi.on("session_start", async (_event, ctx) => {
-		const recoveryDc = makeDeliveryCtx(pi, ctx, true); // recovery mode (nextTurn)
+		const sessionId = ctx.sessionManager.getSessionId();
+		const liveDc = makeDeliveryCtx(pi, ctx, ownership, sessionId, false);
+		let recoveryDone = false;
+		ownership.start(ctx.cwd, sessionId, () => {
+			if (recoveryDone && liveDc.isCurrent()) attachPoller(ctx.cwd, liveDc);
+		});
+		const recoveryDc = makeDeliveryCtx(pi, ctx, ownership, sessionId, true); // recovery mode (nextTurn)
 		if (ctx.hasUI) {
 			unregisterFooterDetail = registerFooterDetail({
 				id: "task-monitor",
@@ -320,13 +334,16 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.notify(`task-monitor: recovery failed: ${(e as Error).message}`, "error");
 		}
 		// The poller must use LIVE delivery (steer + triggerTurn) for exit callbacks.
-		ensurePoller(ctx.cwd, makeDeliveryCtx(pi, ctx, false));
+		recoveryDone = true;
+		if (recoveryDc.isCurrent()) ensurePoller(ctx.cwd, liveDc);
 		void pruneOld(ctx.cwd) // best-effort 7-day prune of terminal tasks
 			.catch(() => {});
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		ownership.stop();
 		stopPollerFor(ctx.cwd); // tasks are intentionally durable — never killed here
+		discardPending(ctx.cwd);
 		if (ctx.hasUI && footerDetailContext === ctx) {
 			unregisterFooterDetail?.();
 			unregisterFooterDetail = undefined;
@@ -355,11 +372,12 @@ export default function (pi: ExtensionAPI) {
 			log_file: Type.Optional(Type.String({ description: "Mirror output file (absolute, or relative to the task cwd): output is appended there via tee, in real time, and the file is never auto-deleted — it accumulates across runs. The managed .pi/tasks/ log remains the primary record. Default: managed log only." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const cwd = params.cwd ? resolve(ctx.cwd, params.cwd.replace(/^@/, "")) : ctx.cwd;
-			if (!existsSync(cwd)) throw new Error(`cwd does not exist: ${cwd}`);
+			const sessionId = ctx.sessionManager.getSessionId();
+			const execCwd = params.cwd ? resolve(ctx.cwd, params.cwd.replace(/^@/, "")) : ctx.cwd;
+			if (!existsSync(execCwd)) throw new Error(`cwd does not exist: ${execCwd}`);
 			let logFile: string | undefined;
 			if (params.log_file) {
-				logFile = resolve(cwd, params.log_file.replace(/^@/, ""));
+				logFile = resolve(execCwd, params.log_file.replace(/^@/, ""));
 				mkdirSync(dirname(logFile), { recursive: true });
 			}
 			let entry: TaskEntry;
@@ -367,30 +385,34 @@ export default function (pi: ExtensionAPI) {
 				// spawnTask: reserves the registry entry under the lock, spawns the
 				// detached wrapper (dir must pre-exist — the wrapper redirects into
 				// it ~300ms in), then records the pid under the lock.
-				entry = await spawnTask(cwd, params.command, {
+				entry = await spawnTask(ctx.cwd, params.command, {
+					execCwd,
 					name: params.name,
 					timeoutSeconds: params.timeout_seconds ?? null,
 					callback: params.callback ?? true,
 					logFile,
+					owner: ownership.owner(sessionId),
 				});
 			} catch (e) {
 				throw new Error(`spawn failed: ${(e as Error).message}`);
 			}
+			ownership.announce(); // first task may have created the registry after session_start
 			// Settle once: an instantly-dead command (e.g. `exit 3`) may already be
 			// terminal. If so, the tool result below IS the notification — watermark
 			// it so the poller doesn't send a duplicate callback.
-			const settled = await settleRegistry(cwd);
+			const settled = await settleRegistry(ctx.cwd);
 			entry = settled.tasks.find((x) => x.id === entry.id)!;
 			if (entry.state !== "running") {
-				await withRegistryLock(cwd, (reg) => {
+				await withRegistryLock(ctx.cwd, (reg) => {
 					const x = reg.tasks.find((y) => y.id === entry.id);
 					if (x) x.reported = { state: x.state, logBytes: x.logBytes };
 				});
-				entry = loadRegistry(cwd).tasks.find((x) => x.id === entry.id)!;
-				void pruneDelivered(cwd).catch(() => {}); // tool result was the notification
+				entry = loadRegistry(ctx.cwd).tasks.find((x) => x.id === entry.id)!;
+				void pruneDelivered(ctx.cwd).catch(() => {}); // tool result was the notification
 			}
 			refreshFooter(ctx);
-			ensurePoller(cwd, makeDeliveryCtx(pi, ctx, false));
+			if (ownership.current(ctx.cwd, sessionId))
+				ensurePoller(ctx.cwd, makeDeliveryCtx(pi, ctx, ownership, sessionId, false));
 
 			const id = entry.id;
 			const notify =

@@ -22,6 +22,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import {
 	type TaskEntry,
+	type TaskOwner,
 	deriveName,
 	newTaskId,
 	tasksDir,
@@ -68,7 +69,7 @@ function spawnWrapper(entry: TaskEntry): number {
 export async function spawnTask(
 	cwd: string,
 	command: string,
-	opts: { name?: string; timeoutSeconds?: number | null; callback: boolean; logFile?: string },
+	opts: { name?: string; timeoutSeconds?: number | null; callback: boolean; logFile?: string; owner?: TaskOwner; execCwd?: string },
 ): Promise<TaskEntry> {
 	const dir = tasksDir(cwd);
 	mkdirSync(dir, { recursive: true });
@@ -81,13 +82,14 @@ export async function spawnTask(
 			id,
 			name: opts.name ?? deriveName(command),
 			command,
-			cwd,
+			cwd: opts.execCwd ?? cwd,
 			pid: 0,
 			log: join(dir, `${id}.log`),
 			exitFile: join(dir, `${id}.exit`),
 			createdAt: Date.now(),
 			timeoutSeconds: opts.timeoutSeconds ?? null,
 			callback: opts.callback,
+			owner: opts.owner,
 			state: "running",
 			exitCode: null,
 			endedAt: null,

@@ -23,6 +23,10 @@ import { fmtDur } from "./format.js";
 import { usageSummaryLine } from "./usage.js";
 
 export interface DeliveryCtx {
+	/** Re-check immediately before claim and watermark: session switches may happen mid-tick. */
+	canDeliver: (task: TaskEntry) => boolean;
+	belongsToSession: (task: TaskEntry) => boolean;
+	isCurrent: () => boolean;
 	sendMessage: (content: string, details: unknown) => Promise<void> | void;
 	notify: (msg: string, kind: "info" | "warning" | "error") => void;
 	/** Ask the UI to re-render the footer block (footer-bus detail). */
@@ -46,6 +50,13 @@ function claimPath(cwd: string, id: string): string {
 
 export function hasPending(cwd: string): boolean {
 	return pending.has(cwd);
+}
+
+/** A session replacement must never retry the old session's message in the new one. */
+export function discardPending(cwd: string): void {
+	const batch = pending.get(cwd);
+	pending.delete(cwd);
+	if (batch) for (const t of batch.tasks) releaseClaim(cwd, t.id);
 }
 
 export function tryClaim(cwd: string, id: string): boolean {
@@ -73,9 +84,9 @@ export function hasClaim(cwd: string, id: string): boolean {
 }
 
 /**
- * Reap claims that can never be delivered:
- *  - watermarked (already reported; the claim is just leftover), or
- *  - stale (older than CLAIM_STALE_MS; the claiming process is gone).
+ * Reap stale claims (older than CLAIM_STALE_MS), including claims left by a
+ * process that crashed between claim and watermark. Do not remove a fresh
+ * watermarked claim: its sender may still be constructing/sending a message.
  * Runs each tick and at session_start.
  */
 export function clearStaleClaims(cwd: string, tasks: TaskEntry[]): void {
@@ -85,9 +96,7 @@ export function clearStaleClaims(cwd: string, tasks: TaskEntry[]): void {
 		const p = claimPath(cwd, t.id);
 		try {
 			const st = statSync(p);
-			const watermarked = t.reported.state === t.state;
-			const stale = now - st.mtimeMs > CLAIM_STALE_MS;
-			if (watermarked || stale) releaseClaim(cwd, t.id);
+			if (now - st.mtimeMs > CLAIM_STALE_MS) releaseClaim(cwd, t.id);
 		} catch {
 			/* no claim */
 		}
@@ -165,13 +174,17 @@ export async function deliverEvents(
 	const prev = pending.get(cwd);
 	if (prev) {
 		pending.delete(cwd);
-		await sendBatch(cwd, prev.tasks, prev.count, dc, build, sent);
+		if (dc.isCurrent() && prev.tasks.every(dc.canDeliver)) {
+			await sendBatch(cwd, prev.tasks, prev.count, dc, build, sent);
+		} else {
+			for (const t of prev.tasks) releaseClaim(cwd, t.id);
+		}
 	}
 
 	// 2. fresh transitions
 	const claimed: TaskEntry[] = [];
 	for (const t of due) {
-		if (tryClaim(cwd, t.id)) claimed.push(t);
+		if (dc.isCurrent() && dc.canDeliver(t) && tryClaim(cwd, t.id)) claimed.push(t);
 	}
 	if (claimed.length > 0) {
 		await sendBatch(cwd, claimed, 1, dc, build, sent);
@@ -193,21 +206,29 @@ async function sendBatch(
 	for (const t of tasks) {
 		const fresh = await withRegistryLock(cwd, (reg) => {
 			const f = reg.tasks.find((x) => x.id === t.id);
-			if (!f) return null;
+			if (!f || !dc.isCurrent() || !dc.canDeliver(f) || !f.callback || f.state !== t.state ||
+				f.state === "running" || f.state === "cancelled" ||
+				(count === 1 && f.reported.state === f.state)) return null;
 			f.reported = { state: f.state, logBytes: f.logBytes };
 			return structuredClone(f);
 		});
 		if (fresh) watermarked.push(fresh);
+		else releaseClaim(cwd, t.id);
 	}
-	if (watermarked.length === 0) {
-		for (const t of tasks) releaseClaim(cwd, t.id);
-		return;
+	if (watermarked.length === 0) return;
+	if (!dc.isCurrent()) {
+		for (const t of watermarked) releaseClaim(cwd, t.id);
+		return; // already watermarked: at-most-once loss if the session switched here
 	}
 	try {
 		await dc.sendMessage(build(watermarked), detailsFor(watermarked));
 		for (const t of watermarked) releaseClaim(cwd, t.id);
 		sent.push(...watermarked.map((t) => t.id));
 	} catch (e) {
+		if (!dc.isCurrent()) {
+			for (const t of watermarked) releaseClaim(cwd, t.id);
+			return;
+		}
 		// Keep claims: retried next tick; give up after MAX_SEND_RETRIES
 		// (watermark stays -> never re-claimed as a fresh transition).
 		if (count > MAX_SEND_RETRIES) {

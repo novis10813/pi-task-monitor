@@ -21,6 +21,12 @@ import { join } from "node:path";
 
 export type TaskState = "running" | "exited" | "timed_out" | "cancelled" | "log_overflow";
 
+export interface TaskOwner {
+	sessionId: string;
+	/** Random ID for the spawning pi process, not the background command PID. */
+	processId: string;
+}
+
 export interface TaskEntry {
 	id: string;
 	name: string;
@@ -33,6 +39,8 @@ export interface TaskEntry {
 	timeoutSeconds: number | null;
 	/** Whether a terminal state should wake the agent (callback). */
 	callback: boolean;
+	/** Absent on pre-routing entries: they remain inspectable, but cannot be auto-delivered safely. */
+	owner?: TaskOwner;
 	state: TaskState;
 	exitCode: number | null; // null while running, or "unknown" after external kill
 	endedAt: number | null;

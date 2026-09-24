@@ -19,9 +19,15 @@ degrades CPU sampling to lifetime averages).
   woken with a `[task-event]` message: state, exit code, duration, log tail,
   and — for non-zero exits — a resource-usage peak line (helps diagnose OOM /
   runaway CPU).
-- **Recovery report** — if tasks exited while no pi session was open, the next
-  `session_start` injects a `[task-event recovery]` message into the agent's
-  first turn, listing what happened.
+- **Session-aware callbacks** — a task belongs to the pi session that spawned
+  it. Its original pi process gets first chance to report completion; if that
+  process quits or switches sessions, another process attached to the same
+  session may report it. Even if that other window was idle before the task
+  was spawned, its 5s owner heartbeat discovers the new registry entry and
+  reattaches its poller. Other sessions in the workspace never claim it.
+- **Recovery report** — the next `session_start` of the **owning session**
+  reports its unreported exits as `[task-event recovery]`. A different session
+  may still inspect workspace tasks via `/tasks`, but cannot consume callbacks.
 - **Footer** — a footer-bus detail block (rendered by `footer-composer`,
   same mechanism as the subagent footer): running tasks with live durations
   (3s poller ticks drive re-renders), plus a 3s flash for tasks that just
@@ -32,9 +38,9 @@ degrades CPU sampling to lifetime averages).
   killing stay in `/tasks`.
 - **Prune** — two-tier: a terminal task is removed (registry entry + log/exit/
   usage/claim files) on the tick after its transition was delivered to the
-  agent; the 7-day age-based prune remains as a fallback for tasks spawned
-  with `callback=false`, which are never delivered. Running tasks are never
-  pruned.
+  agent; the 7-day age-based prune remains as a fallback for entries without
+  an auto-deliverable callback (`callback=false` or legacy ownerless tasks).
+  Running tasks are never pruned.
 - **Persistent log mirror (`log_file`)** — pass a path (absolute, or relative
   to the task `cwd`; parent dirs are created) and output is **tee'd** into it
   (append mode) in real time, while the managed per-task log remains the
@@ -57,6 +63,7 @@ task-monitor's source of truth is **on disk** (`<project>/.pi/tasks/`):
   <id>.exit              # "<exit-code> <epoch-seconds>" sidecar
   <id>.usage.jsonl       # 3s-interval resource samples (2 MiB, 1-gen rotation)
   <id>.claim             # transient cross-process "I will report this" locks
+  owners/<process-id>.json # live pi process + current session (5s heartbeat)
   .registry.lock         # transient single-writer lock (O_EXCL, stale-broken)
 ```
 
@@ -77,11 +84,11 @@ runs in a **subshell** so a user `exit N` can't skip the sidecar write.
 
 - **Callback delivery is at-most-once, never duplicated.** Each task's
   transition is claimed (`O_EXCL` file, safe across pi processes), watermarked
-  in the registry (durably, before the message is sent), then sent; a crash in
-  the save→send window loses that one notification, and with it the task's
-  record (delivered-looking tasks are pruned). The `/tasks` panel shows a task
-  until it is delivered or aged out — and the next session start
-  re-reports it as recovery if the watermark was never written.
+  in the registry (durably, before the message is sent), then sent; a crash or
+  session switch in the save→send window loses that one notification, and with
+  it the task's record (delivered-looking tasks are pruned). The `/tasks` panel
+  shows a task until it is delivered or aged out; the owning session's next
+  start re-reports it if the watermark was never written.
 - **Cancelled tasks never notify** (an explicit stop isn't news); the
   suppression is durable via the watermark.
 - **`endedAt` accuracy:** the sidecar carries the real exit time, so durations
@@ -90,13 +97,24 @@ runs in a **subshell** so a user `exit N` can't skip the sidecar write.
 - **Single writer:** all registry mutations go through `withRegistryLock`
   (in-process mutex + O_EXCL file lock with 2s stale-break, fresh read →
   mutate → atomic tmp+rename save). Two pi sessions on one project are safe.
-- **Poller cost:** one 3s tick per project while tasks run; self-stops when
-  idle; `session_start` also settles, so state never lags
-  more than one tick when something is alive.
+- **Poller cost:** one 3s tick per project per open pi process while tasks run
+  or a completion for that session is waiting for the original process to
+  leave. A 5s presence heartbeat tracks which pi process still owns its
+  session (30s stale threshold). Session-file mtime is not used: an idle agent
+  may not write to its session file for hours. The 3s poller self-stops when
+  idle, but the 5s heartbeat still checks for tasks created by other windows;
+  `session_start` also settles.
 - **GPU:** `nvidia-smi` auto-detected once per process; absent ⇒
   `gpu`/`vram` are `null` with zero overhead (AMD/ROCm is out of scope for v1).
 - **Log cap:** 20 MiB hard cap, no rotation (avoids sparse-file / orphan-inode
   pitfalls); overflow kills the group and marks `log_overflow`.
+- **Legacy entries:** tasks created before owner tracking lack session identity;
+  they remain visible in `/tasks` but are not auto-delivered to a random
+  session. The existing 7-day age-based prune still applies.
+- **Custom `cwd`:** changes the command's execution directory only. New tasks
+  are stored in the launching session's workspace registry, so `/tasks`, kill,
+  and restart recovery find them. Older tasks previously stored inside a
+  custom cwd are not migrated automatically.
 
 ## File map
 
@@ -107,12 +125,14 @@ runs in a **subshell** so a user `exit N` can't skip the sidecar write.
 | `spawner.ts` | detached spawn, wrapper, `killGroup`, `cancelTask` |
 | `poller.ts` | `settleRegistry` (the only state-transition code), 3s heartbeat, prune |
 | `usage.ts` | /proc CPU (jiffies Δ) + RSS, nvidia-smi GPU%/VRAM, JSONL sampling, exit-callback resource summary |
-| `delivery.ts` | claim + watermark + send (exactly-once-ish), recovery message builder |
+| `delivery.ts` | claim + watermark + send (at-most-once), recovery message builder |
+| `ownership.ts` | session/process ownership and on-disk process presence |
 | `format.ts` | display helpers (durations, labels, colors, footer block renderer) |
 
 ## Development
 
 - Type-check: `tsc -p tsconfig.json` (paths point at the installed pi dist).
+- Tests: `node task-monitor.test.mjs && node ownership.test.mjs`.
 - Smoke test (mock pi, no LLM): `/tmp/tm-spike/smoke.mjs` — 41 checks covering
   spawn, callbacks, recovery, kill, prune, cross-tick concurrency. (Written for
   the pre-v1 tool set; the `monitor`-tool checks no longer apply.)
@@ -125,3 +145,7 @@ runs in a **subshell** so a user `exit N` can't skip the sidecar write.
 - Windows.
 - AMD/Intel GPU metrics.
 - Cross-machine durability (the registry is per-project, on the local disk).
+- Auto-routing to unrelated sessions in the same workspace or to fork/clone
+  descendants. Restart the original session to receive its callback. An
+  ephemeral `--no-session` run has no resumable session, so tasks still
+  running when it closes have no automatic callback recipient.

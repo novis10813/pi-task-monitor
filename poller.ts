@@ -1,6 +1,6 @@
 // poller.ts — the 3s heartbeat: settles state transitions, samples resource
 // usage, and delivers exit callbacks. One poller per cwd (module-level map);
-// self-stops when nothing is running (zero cost when idle).
+// self-stops when nothing is running; the owner heartbeat probes for new tasks.
 //
 // settleRegistry is the SINGLE place durable state transitions happen
 // (timeout / exit / log-overflow / cancel-reaper), under the registry lock.
@@ -22,12 +22,13 @@ import {
 } from "./registry.js";
 import { killGroup } from "./spawner.js";
 import { sampleUsage, usageFileFor, usageSummaryLine } from "./usage.js";
-import { deliverEvents, hasClaim, type DeliveryCtx } from "./delivery.js";
+import { clearStaleClaims, deliverEvents, hasClaim, hasPending, type DeliveryCtx } from "./delivery.js";
 import { forgetTask } from "./usage.js";
 import { fmtDur } from "./format.js";
 
 const POLL_INTERVAL_MS = 3_000;
 const LOG_HARD_CAP_BYTES = 20 * 1024 * 1024;
+const SPAWN_GRACE_MS = 15_000; // pid=0 is a reservation until spawnTask records the wrapper pid
 
 const pollers = new Map<string, { timer: NodeJS.Timeout; alive: boolean }>();
 
@@ -48,6 +49,7 @@ export async function settleRegistry(cwd: string, now = Date.now()): Promise<Reg
 				continue;
 			}
 			if (t.state !== "running") continue;
+			if (t.pid === 0 && now - t.createdAt < SPAWN_GRACE_MS) continue;
 			// 1. timeout
 			if (t.timeoutSeconds !== null && t.createdAt + t.timeoutSeconds * 1000 <= now) {
 				killGroup(t.pid); // fire-and-forget (SIGTERM -> 5s -> SIGKILL)
@@ -85,10 +87,11 @@ export async function runTick(cwd: string, dc: DeliveryCtx): Promise<void> {
 	if (running.length > 0) {
 		await sampleUsage(running); // never throws; gpu/vram null without nvidia
 	}
+	clearStaleClaims(cwd, registry.tasks);
 	const due = registry.tasks.filter(
 		(t) => t.callback === true && t.reported.state !== t.state,
 	);
-	if (due.length > 0) {
+	if (due.length > 0 || hasPending(cwd)) {
 		await deliverEvents(cwd, due, dc, buildExitMessage);
 	}
 	await pruneDelivered(cwd);
@@ -137,7 +140,10 @@ function startPoller(cwd: string, dc: DeliveryCtx): void {
 			// A failing tick must not kill the poller.
 			dc.notify(`task-monitor: poller error: ${(e as Error).message}`, "error");
 		}
-		if (!loadRegistry(cwd).tasks.some((t) => t.state === "running")) {
+		// An old in-flight tick must not disarm a newer poller after a restart.
+		if (!entry.alive) return;
+		if (!hasPending(cwd) && !loadRegistry(cwd).tasks.some((t) => t.state === "running" ||
+			(t.callback && t.reported.state !== t.state && dc.belongsToSession(t) && dc.isCurrent()))) {
 			entry.alive = false; // idle: self-stop (spawn/restart re-arms)
 			pollers.delete(cwd);
 			return;
@@ -165,9 +171,14 @@ export function ensurePoller(cwd: string, dc: DeliveryCtx): void {
 	stopPoller(cwd);
 	const reg = loadRegistry(cwd);
 	const hasRunning = reg.tasks.some((t) => t.state === "running");
-	const hasDue = reg.tasks.some((t) => t.callback === true && t.reported.state !== t.state);
-	if (!hasRunning && !hasDue) return;
+	const hasDue = reg.tasks.some((t) => t.callback === true && t.reported.state !== t.state && dc.belongsToSession(t));
+	if (!hasRunning && !hasDue && !hasPending(cwd)) return;
 	startPoller(cwd, dc);
+}
+
+/** Heartbeat reattachment must not reset an already-running 3s poller. */
+export function attachPoller(cwd: string, dc: DeliveryCtx): void {
+	if (!pollers.has(cwd)) ensurePoller(cwd, dc);
 }
 
 export function stopPollerFor(cwd: string): void {

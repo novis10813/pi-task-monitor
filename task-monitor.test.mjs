@@ -189,7 +189,7 @@ try {
 	extMod.default(pi);
 
 	const cwd = fsSync.mkdtempSync(path.join(os.tmpdir(), "tm-footer-"));
-	const ctx = { cwd, hasUI: true, ui: { setStatus: () => {}, notify: () => {} } };
+	const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "footer-test" }, ui: { setStatus: () => {}, notify: () => {} } };
 	try {
 		await handlers.session_start[0]({}, ctx);
 		assert.ok(bus.getFooterDetails().has("task-monitor"), "session_start registers the footer detail");

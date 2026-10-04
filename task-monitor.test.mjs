@@ -1,5 +1,5 @@
-// task-monitor footer block tests (renderTaskBlock + duration helpers).
-// Pure-formatter tests; no registry on disk needed (tasks are plain objects).
+// task-monitor footer block tests (toFooterBlock + duration helpers).
+// Pure mapper tests; no registry on disk needed (tasks are plain objects).
 
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
@@ -70,92 +70,31 @@ const failTask = makeTask({ id: "tm03", name: "deploy", state: "exited", exitCod
 const stale = makeTask({ id: "tm04", name: "old", state: "exited", exitCode: 0, createdAt: NOW - 600_000, endedAt: NOW - 10_000 });
 const cancelled = makeTask({ id: "tm05", name: "stop", state: "cancelled", createdAt: NOW - 50_000, endedAt: NOW - 1_000 });
 
-function recording() {
-  const calls = [];
-  return { calls, fg: (c, t) => (calls.push([c, t]), t), bold: (t) => t };
-}
-
 try {
-  assert.equal(fmt.FINISH_FLASH_MS, 3000, "flash window is 3s");
-
-  // --- visibility rules -----------------------------------------------------
-  assert.equal(fmt.renderTaskBlock([], 80, plain, NOW), undefined, "no tasks -> no block");
-  assert.equal(fmt.renderTaskBlock([stale], 80, plain, NOW), undefined, "terminal outside flash window -> no block");
-  assert.equal(fmt.renderTaskBlock([cancelled], 80, plain, NOW), undefined, "cancelled never shows");
-  const edge = makeTask({ id: "tm07", name: "edge", state: "exited", exitCode: 0, createdAt: NOW - 10_000, endedAt: NOW - 3_000 });
-  assert.ok(fmt.renderTaskBlock([edge], 80, plain, NOW), "endedAt exactly at window edge still shows");
-
-  // --- wide layout ----------------------------------------------------------
+  // --- mapping --------------------------------------------------------------
+  const block = fmt.toFooterBlock([running1, okTask, failTask, stale, cancelled]);
+  assert.equal(block.v, 1, "protocol version 1");
+  assert.equal(block.id, "task-monitor");
+  assert.equal(block.label, "Tasks");
+  assert.deepEqual(block.items.map((i) => i.key), ["tm01", "tm02", "tm03", "tm04"], "cancelled never shows");
   assert.deepEqual(
-    fmt.renderTaskBlock([running1], 80, plain, NOW),
-    ["⎿ Tasks: 1 running", '  ▸ tm01 "build" 20m30s'],
-    "single running task (wide)",
+    block.items[0],
+    { key: "tm01", state: "running", title: "tm01", text: '"build"', startedAt: NOW - 1_230_000 },
+    "running task has no endedAt",
   );
   assert.deepEqual(
-    fmt.renderTaskBlock([okTask, running1, failTask], 80, plain, NOW),
-    [
-      "⎿ Tasks: 1 running",
-      '  ▸ tm01 "build" 20m30s',
-      '  ✗ tm03 "deploy" exited(1) 45s',
-      '  ✓ tm02 "migrate" exited(0) 3m10s',
-    ],
-    "running first, then finished by recency",
+    block.items[1],
+    { key: "tm02", state: "success", title: "tm02", text: '"migrate" exited(0)', startedAt: NOW - 192_000, endedAt: NOW - 2_500 },
+    "exit 0 -> success",
   );
-  assert.deepEqual(
-    fmt.renderTaskBlock([okTask, failTask], 80, plain, NOW),
-    [
-      "⎿ Tasks: 2 finished",
-      '  ✗ tm03 "deploy" exited(1) 45s',
-      '  ✓ tm02 "migrate" exited(0) 3m10s',
-    ],
-    "finished-only header",
-  );
+  assert.equal(block.items[2].state, "error", "non-zero exit -> error");
+  assert.equal(block.items[2].text, '"deploy" exited(1)');
+  assert.equal(block.items[3].endedAt, NOW - 10_000, "stale terminal tasks are sent; the composer applies the flash window");
   const timedOut = makeTask({ id: "tm06", name: "watch", state: "timed_out", createdAt: NOW - 40_000, endedAt: NOW });
-  assert.deepEqual(
-    fmt.renderTaskBlock([timedOut], 80, plain, NOW),
-    ["⎿ Tasks: 1 finished", '  ⚠ tm06 "watch" timed_out 40s'],
-    "timed_out row",
-  );
-
-  // --- narrow layout --------------------------------------------------------
-  assert.deepEqual(
-    fmt.renderTaskBlock([running1], 40, plain, NOW),
-    ["⎿ Tasks: 1 running · tm01 20m30s"],
-    "narrow collapses to one line",
-  );
-  assert.deepEqual(
-    fmt.renderTaskBlock([okTask, running1], 40, plain, NOW),
-    ["⎿ Tasks: 1 running · tm01 20m30s"],
-    "narrow prefers running over finished",
-  );
-  assert.deepEqual(
-    fmt.renderTaskBlock([okTask], 40, plain, NOW),
-    ["⎿ Tasks: 1 finished · tm02 exited(0)"],
-    "narrow finished-only line",
-  );
-
-  // --- row cap --------------------------------------------------------------
-  const many = Array.from({ length: 6 }, (_, i) => makeTask({ id: `tm${String(i + 1).padStart(2, "0")}`, name: `t${i}` }));
-  const capped = fmt.renderTaskBlock(many, 80, plain, NOW);
-  assert.equal(capped.length, 6, "header + 4 rows + overflow line");
-  assert.equal(capped[5], "… +2 more", "overflow count");
-
-  // --- colors ---------------------------------------------------------------
-  const th = recording();
-  fmt.renderTaskBlock([running1, okTask, failTask, timedOut], 80, th, NOW);
-  const called = (c, t) => th.calls.some(([cc, tt]) => cc === c && tt === t);
-  assert.ok(called("dim", "⎿ "), "header icon is dim");
-  assert.ok(called("text", "Tasks: 1 running"), "header label is text");
-  assert.ok(called("accent", "▸"), "running marker is accent");
-  assert.ok(called("accent", "tm01"), "running id is accent");
-  assert.ok(called("text", '"build"'), "name is text");
-  assert.ok(called("dim", "20m30s"), "running duration is dim");
-  assert.ok(called("success", "✓"), "exit 0 icon is success");
-  assert.ok(called("success", "exited(0)"), "exit 0 label is success");
-  assert.ok(called("error", "✗"), "exit 1 icon is error");
-  assert.ok(called("error", "exited(1)"), "exit 1 label is error");
-  assert.ok(called("warning", "⚠"), "timed_out icon is warning");
-  assert.ok(called("warning", "timed_out"), "timed_out label is warning");
+  assert.equal(fmt.toFooterBlock([timedOut]).items[0].state, "warning", "timed_out -> warning");
+  const unknownExit = makeTask({ id: "tm08", state: "exited", exitCode: null, endedAt: null });
+  assert.equal(fmt.toFooterBlock([unknownExit]).items[0].endedAt, unknownExit.createdAt, "missing endedAt falls back to createdAt");
+  assert.deepEqual(fmt.toFooterBlock([]).items, [], "empty registry clears the block");
 
   // --- duration helpers -----------------------------------------------------
   assert.equal(fmt.durationOf(running1, NOW), "20m30s", "running duration at injected now");
@@ -170,55 +109,70 @@ try {
   throw error;
 }
 
-// --- runtime smoke: index.ts registers the footer-bus detail --------------
-// Verifies pi-jiti resolves the cross-extension import ("../shared/footer-bus.js")
-// and the detail renders from the on-disk registry. No pi spawn, no LLM.
+// --- runtime smoke: index.ts publishes footer:block over pi.events --------
+// Covers session_start publish, footer:sync resend and the no-UI guard.
+// No pi spawn, no LLM.
 {
 	const extMod = await jiti.import(fileURLToPath(new URL("./index.ts", import.meta.url)));
-	const bus = await jiti.import(fileURLToPath(new URL("../shared/footer-bus.ts", import.meta.url)));
 	const registry = await jiti.import(fileURLToPath(new URL("./registry.ts", import.meta.url)));
 
-	bus.resetFooterDetails();
-	const handlers = {};
-	const pi = {
-		on: (name, fn) => (handlers[name] ??= []).push(fn),
-		registerTool: () => {},
-		registerCommand: () => {},
-		sendMessage: async () => {},
+	const makePi = () => {
+		const handlers = {};
+		const listeners = {};
+		const emitted = [];
+		const pi = {
+			on: (name, fn) => (handlers[name] ??= []).push(fn),
+			registerTool: () => {},
+			registerCommand: () => {},
+			sendMessage: async () => {},
+			events: {
+				on: (channel, fn) => (listeners[channel] ??= []).push(fn),
+				emit: (channel, data) => {
+					emitted.push([channel, data]);
+					for (const fn of listeners[channel] ?? []) fn(data);
+				},
+			},
+		};
+		extMod.default(pi);
+		return { pi, handlers, emitted };
 	};
-	extMod.default(pi);
 
 	const cwd = fsSync.mkdtempSync(path.join(os.tmpdir(), "tm-footer-"));
 	const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "footer-test" }, ui: { setStatus: () => {}, notify: () => {} } };
+	const { pi, handlers, emitted } = makePi();
+	const blocks = () => emitted.filter(([channel]) => channel === "footer:block").map(([, data]) => data);
 	try {
 		await handlers.session_start[0]({}, ctx);
-		assert.ok(bus.getFooterDetails().has("task-monitor"), "session_start registers the footer detail");
-
-		const render = () => bus.getFooterDetails().get("task-monitor").render({ width: 80, theme: plain });
-		assert.equal(render(), undefined, "empty registry -> no block");
+		assert.ok(blocks().length > 0, "session_start publishes a block");
+		assert.deepEqual(blocks().at(-1).items, [], "empty registry -> empty block");
 
 		registry.saveRegistry(cwd, {
 			version: 1,
-			tasks: [
-				makeTask({ id: "tm01", name: "build", createdAt: Date.now() - 120_000 }),
-				makeTask({ id: "tm02", name: "migrate", state: "exited", exitCode: 0, createdAt: Date.now() - 190_000, endedAt: Date.now() - 1_000 }),
-			],
+			tasks: [makeTask({ id: "tm01", name: "build", createdAt: Date.now() - 120_000 })],
 		});
-		assert.deepEqual(
-			render(),
-			[
-				"⎿ Tasks: 1 running",
-				'  ▸ tm01 "build" 2m0s',
-				'  ✓ tm02 "migrate" exited(0) 3m9s',
-			],
-			"detail renders from the on-disk registry (fresh read)",
-		);
+		const before = blocks().length;
+		pi.events.emit("footer:sync", {});
+		assert.equal(blocks().length, before + 1, "footer:sync triggers a resend");
+		assert.deepEqual(blocks().at(-1).items.map((i) => [i.key, i.state]), [["tm01", "running"]], "resend reads the on-disk registry");
 
 		await handlers.session_shutdown[0]({}, ctx);
-		assert.equal(bus.getFooterDetails().has("task-monitor"), false, "session_shutdown unregisters the detail");
+		const afterShutdown = blocks().length;
+		pi.events.emit("footer:sync", {});
+		assert.equal(blocks().length, afterShutdown, "no resend after session_shutdown");
 		console.log("PASS  task-monitor footer smoke");
 	} finally {
 		fsSync.rmSync(cwd, { recursive: true, force: true });
-		bus.resetFooterDetails();
+	}
+
+	const headlessCwd = fsSync.mkdtempSync(path.join(os.tmpdir(), "tm-footer-headless-"));
+	const headless = makePi();
+	try {
+		await headless.handlers.session_start[0]({}, { ...ctx, cwd: headlessCwd, hasUI: false });
+		headless.pi.events.emit("footer:sync", {});
+		assert.equal(headless.emitted.filter(([channel]) => channel === "footer:block").length, 0, "headless session publishes nothing");
+		await headless.handlers.session_shutdown[0]({}, { ...ctx, cwd: headlessCwd, hasUI: false });
+		console.log("PASS  task-monitor footer headless");
+	} finally {
+		fsSync.rmSync(headlessCwd, { recursive: true, force: true });
 	}
 }

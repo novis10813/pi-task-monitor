@@ -29,7 +29,7 @@ export interface DeliveryCtx {
 	isCurrent: () => boolean;
 	sendMessage: (content: string, details: unknown) => Promise<void> | void;
 	notify: (msg: string, kind: "info" | "warning" | "error") => void;
-	/** Ask the UI to re-render the footer block (footer-bus detail). */
+	/** Publish the footer block snapshot to footer-composer. */
 	notifyFooter: () => void;
 }
 

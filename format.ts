@@ -1,7 +1,6 @@
-// format.ts — shared display helpers (durations, state labels/colors, footer).
+// format.ts — shared display helpers (durations, state labels/colors, footer block).
 
 import type { ThemeColor } from "@earendil-works/pi-coding-agent";
-import type { FooterDetailTheme } from "../shared/footer-bus.js";
 import type { TaskEntry } from "./registry.js";
 
 export function fmtDur(ms: number): string {
@@ -38,66 +37,42 @@ export function stateColor(t: TaskEntry): ThemeColor {
 }
 
 // ---------------------------------------------------------------------------
-// footer block (footer-bus detail; structure mirrors subagent/footer.ts)
+// footer block (footer:block payload; protocol and format live in footer-composer.ts)
 // ---------------------------------------------------------------------------
 
-/** Terminal tasks stay in the footer this long after ending (the "flash"). */
-export const FINISH_FLASH_MS = 3_000;
-const NARROW_WIDTH = 48;
-const MAX_RUNNING_ITEMS = 4;
-const MAX_FINISHED_ITEMS = 4;
+export const FOOTER_BLOCK_CHANNEL = "footer:block";
+export const FOOTER_SYNC_CHANNEL = "footer:sync";
+
+function footerState(t: TaskEntry): "running" | "success" | "error" | "warning" {
+	switch (t.state) {
+		case "running":
+			return "running";
+		case "exited":
+			return t.exitCode === 0 ? "success" : "error";
+		default:
+			return "warning"; // timed_out / log_overflow
+	}
+}
 
 /**
- * Render the task-monitor footer block. Pure; `now` is injectable for tests.
- * Running tasks always show; terminal tasks only within FINISH_FLASH_MS of
- * `endedAt` (stateless — the registry carries the real exit time). Cancelled
- * tasks never show: an explicit stop is not news (same rule as delivery).
+ * Map the registry to a footer:block snapshot. Pure. Cancelled tasks never
+ * show: an explicit stop is not news (same rule as delivery). The composer
+ * shows terminal tasks only within its flash window after `endedAt`.
  */
-export function renderTaskBlock(
-	tasks: TaskEntry[],
-	width: number,
-	theme: FooterDetailTheme,
-	now = Date.now(),
-): string[] | undefined {
-	const running = tasks.filter((t) => t.state === "running");
-	const finished = tasks
-		.filter(
-			(t) =>
-				t.state !== "running" &&
-				t.state !== "cancelled" &&
-				now - (t.endedAt ?? t.createdAt) <= FINISH_FLASH_MS,
-		)
-		.sort((a, b) => (b.endedAt ?? b.createdAt) - (a.endedAt ?? a.createdAt));
-	if (running.length === 0 && finished.length === 0) return undefined;
-
-	const count = running.length > 0 ? `${running.length} running` : `${finished.length} finished`;
-
-	if (width < NARROW_WIDTH) {
-		let line = theme.fg("dim", "⎿ ") + theme.fg("text", `Tasks: ${count}`);
-		if (running.length > 0) {
-			for (const t of running) line += theme.fg("dim", ` · ${t.id} ${durationOf(t, now)}`);
-		} else {
-			for (const t of finished) line += theme.fg("dim", ` · ${t.id} ${stateLabel(t)}`);
-		}
-		return [line];
-	}
-
-	const lines: string[] = [theme.fg("dim", "⎿ ") + theme.fg("text", `Tasks: ${count}`)];
-	const runningShown = running.slice(0, MAX_RUNNING_ITEMS);
-	for (const t of runningShown) {
-		lines.push(
-			`  ${theme.fg("accent", "▸")} ${theme.fg("accent", t.id)} ${theme.fg("text", `"${t.name}"`)} ${theme.fg("dim", durationOf(t, now))}`,
-		);
-	}
-	const finishedShown = finished.slice(0, MAX_FINISHED_ITEMS);
-	for (const t of finishedShown) {
-		const color = stateColor(t);
-		const icon = t.state === "exited" ? (t.exitCode === 0 ? "✓" : "✗") : "⚠";
-		lines.push(
-			`  ${theme.fg(color, icon)} ${theme.fg(color, t.id)} ${theme.fg("text", `"${t.name}"`)} ${theme.fg(color, stateLabel(t))} ${theme.fg("dim", fmtDur((t.endedAt ?? t.createdAt) - t.createdAt))}`,
-		);
-	}
-	const extra = Math.max(0, running.length + finished.length - (runningShown.length + finishedShown.length));
-	if (extra > 0) lines.push(theme.fg("dim", `… +${extra} more`));
-	return lines;
+export function toFooterBlock(tasks: TaskEntry[]) {
+	return {
+		v: 1 as const,
+		id: "task-monitor",
+		label: "Tasks",
+		items: tasks
+			.filter((t) => t.state !== "cancelled")
+			.map((t) => ({
+				key: t.id,
+				state: footerState(t),
+				title: t.id,
+				text: t.state === "running" ? `"${t.name}"` : `"${t.name}" ${stateLabel(t)}`,
+				startedAt: t.createdAt,
+				...(t.state !== "running" ? { endedAt: t.endedAt ?? t.createdAt } : {}),
+			})),
+	};
 }

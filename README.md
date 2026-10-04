@@ -28,14 +28,12 @@ degrades CPU sampling to lifetime averages).
 - **Recovery report** — the next `session_start` of the **owning session**
   reports its unreported exits as `[task-event recovery]`. A different session
   may still inspect workspace tasks via `/tasks`, but cannot consume callbacks.
-- **Footer** — a footer-bus detail block (rendered by `footer-composer`,
-  same mechanism as the subagent footer): running tasks with live durations
-  (3s poller ticks drive re-renders), plus a 3s flash for tasks that just
-  terminated (`✓`/`✗` + exit code, `⚠` for timeout/log-overflow). `cancelled`
-  never shows (an explicit stop is not news). Wide terminals get one row per
-  task (max 4 + `… +N more`); narrow (<48 cols) collapse to a single summary
-  line. Nothing running / nothing just finished → no block. Details and
-  killing stay in `/tasks`.
+- **Footer** — publishes a `footer:block` snapshot of the registry over
+  `pi.events` after every state-affecting event (and on each 3s poller tick
+  while tasks run); `footer-composer` owns the format, live durations and the
+  3s flash for tasks that just terminated (`✓`/`✗` + exit code, `⚠` for
+  timeout/log-overflow). `cancelled` never shows (an explicit stop is not
+  news). Re-sends on `footer:sync`. Details and killing stay in `/tasks`.
 - **Prune** — two-tier: a terminal task is removed (registry entry + log/exit/
   usage/claim files) on the tick after its transition was delivered to the
   agent; the 7-day age-based prune remains as a fallback for entries without
@@ -127,7 +125,7 @@ runs in a **subshell** so a user `exit N` can't skip the sidecar write.
 | `usage.ts` | /proc CPU (jiffies Δ) + RSS, nvidia-smi GPU%/VRAM, JSONL sampling, exit-callback resource summary |
 | `delivery.ts` | claim + watermark + send (at-most-once), recovery message builder |
 | `ownership.ts` | session/process ownership and on-disk process presence |
-| `format.ts` | display helpers (durations, labels, colors, footer block renderer) |
+| `format.ts` | display helpers (durations, labels, colors) and the `footer:block` mapper |
 
 ## Development
 

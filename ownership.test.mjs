@@ -59,6 +59,7 @@ function mock(sessionId, workspace = cwd) {
     registerTool: (def) => { tools[def.name] = def; },
     registerCommand: () => {},
     sendMessage: async (message, opts) => { sent.push({ message, opts }); },
+    events: { on: () => () => {}, emit: () => {} },
   };
   ext.default(pi);
   const ctx = { cwd: workspace, hasUI: false, ui: { notify: () => {} }, sessionManager: { getSessionId: () => sessionId } };

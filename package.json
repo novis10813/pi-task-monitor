@@ -1,10 +1,16 @@
 {
-	"name": "task-monitor",
+	"name": "pi-task-monitor",
 	"version": "0.1.0",
 	"private": true,
 	"type": "module",
 	"description": "pi extension: durable background process tracking (spawn_background + monitor, survives pi restarts, exit callbacks, resource usage history)",
 	"engines": {
 		"node": ">=22.19.0"
+	},
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"scripts": {
+		"test": "node task-monitor.test.mjs && node ownership.test.mjs"
 	}
 }

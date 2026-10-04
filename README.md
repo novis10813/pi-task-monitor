@@ -4,6 +4,12 @@ A pi extension for **durable background process tracking**. Two focused tools,
 zero npm dependencies (Node builtins only), POSIX only (Linux first; macOS
 degrades CPU sampling to lifetime averages).
 
+## Install
+
+```bash
+pi install git:github.com/novis10813/pi-task-monitor
+```
+
 ## What it does
 
 - **`spawn_background`** — start a long-running shell command as a *detached*
@@ -33,7 +39,8 @@ degrades CPU sampling to lifetime averages).
   while tasks run); `footer-composer` owns the format, live durations and the
   3s flash for tasks that just terminated (`✓`/`✗` + exit code, `⚠` for
   timeout/log-overflow). `cancelled` never shows (an explicit stop is not
-  news). Re-sends on `footer:sync`. Details and killing stay in `/tasks`.
+  news). Re-sends on `footer:sync`. Without a `footer:block` consumer
+  installed the events go nowhere. Details and killing stay in `/tasks`.
 - **Prune** — two-tier: a terminal task is removed (registry entry + log/exit/
   usage/claim files) on the tick after its transition was delivered to the
   agent; the 7-day age-based prune remains as a fallback for entries without
@@ -130,7 +137,7 @@ runs in a **subshell** so a user `exit N` can't skip the sidecar write.
 ## Development
 
 - Type-check: `tsc -p tsconfig.json` (paths point at the installed pi dist).
-- Tests: `node task-monitor.test.mjs && node ownership.test.mjs`.
+- Tests: `npm test` (runs `task-monitor.test.mjs` and `ownership.test.mjs`; needs the node that has pi installed).
 - Smoke test (mock pi, no LLM): `/tmp/tm-spike/smoke.mjs` — 41 checks covering
   spawn, callbacks, recovery, kill, prune, cross-tick concurrency. (Written for
   the pre-v1 tool set; the `monitor`-tool checks no longer apply.)
